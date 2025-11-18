@@ -65,6 +65,7 @@ The script parses the file and expects standard WireGuard keys:
   * `Endpoint` 
   * `AllowedIPs` 
 * **Optional Keys:** The script also supports:
+  * `ListenPort`
   * `DNS`
   * `MTU` 
   * `PresharedKey` 
