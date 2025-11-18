@@ -50,7 +50,12 @@ Each VPN connection can be brought up in an isolated namespace with its own netw
 
 ## Configuration
 
-Your WireGuard configuration files (`.conf`) must be placed in `/etc/wireguard/`. 
+Your WireGuard configuration files (`.conf`) must be placed in `/etc/wireguard/` or in another directory pointed to by the `WGC_CFGDIR` environment variable.
+
+```bash
+export WGC_CFGDIR=/path/to/your/configs
+wgc list
+```
 
 The script uses the filename (without the `.conf` extension) as the VPN identifier. For example, a file at `/etc/wireguard/proton-it.conf` will be managed as the `proton-it` VPN.
 
@@ -86,9 +91,9 @@ The script requires `sudo` or root access because it manipulates network interfa
 * **`up <vpn>`**
   Starts the VPN connection in the **default namespace** using policy-based routing. The VPN's routes are applied based on the source address, allowing the VPN to coexist with your normal network connection.
   
-  This means that if you are connected to an headless host, your ssh session will not close if you start a VPN.
+  This means that an application (e.g. qBittorrent) must bind to the VPN interface or ip address to have its network traffic redirected through the tunnel.
   
-  This also means that an application (e.g. qBittorrent) must bind to the VPN interface or ip address to have its network traffic redirected through the tunnel.
+  This also means that if you are connected via ssh, your session will not close when you start the VPN.
   
   ```bash
   wgc up proton-it
@@ -96,10 +101,23 @@ The script requires `sudo` or root access because it manipulates network interfa
   
   ![](images/start.png)
 
+* **`upd <vpn>`**
+  Starts the VPN connection in the **default namespace** using policy-based routing **and** adding a ***split route*** for the tunnel (0.0.0.0/1, 128.0.0.0/1).
+  
+  This means that any application will have its network traffic routed through the VPN tunnel.
+  
+  This also means that if you are connected via ssh your session will be terminated, unless before starting the VPN you manually add a specific route to your ip address.
+  
+  ```bash
+  wgc upd proton-it
+  ```
+
 * **`nup <vpn>`**
   Starts the VPN connection in its **own isolated namespace**. This provides complete network isolation and is the recommended mode for running specific applications through the VPN.
   
-  Note that network services listening on TCP ports (such as web interfaces) will be isolated and unreachable from the host unless you explicitly set up port forwarding. Interactive applications with GUI or terminal interfaces are not affected by this limitation.
+  A default route (0.0.0.0/0) will be added for the VPN tunnel, so any application will have its network traffic routed through it.
+  
+  **Note:** Applications with network listeners (e.g., web interfaces on TCP ports) will be unreachable from outside the namespace unless you configure port forwarding. Applications with GUI or terminal interfaces remain fully accessible.
   
   ```bash
   wgc nup proton-it
@@ -110,7 +128,7 @@ The script requires `sudo` or root access because it manipulates network interfa
 * **`down <vpn> [force]`**
   Stops the VPN connection.
   
-  * If the VPN is active in the default namespace, stops it.
+  * If the VPN is active in the default namespace (started with `up/upd`), stops it.
   * If the VPN is active in its own namespace (started with `nup`):
     * If no processes are running in the same namespace, stops the VPN.
     * If some processes are running in the same namespace, shows the process list and refuses to stop the VPN.  If you specify `force`, gracefully terminates all processes in the namespace (SIGTERM), waits up to 10 seconds with a progress bar, then forcibly kills remaining processes (SIGKILL). Finally, stops the VPN.
@@ -155,7 +173,7 @@ The script requires `sudo` or root access because it manipulates network interfa
   ![](images/exec.png)
 
 * **`list`**
-  Lists all available `.conf` files found in `/etc/wireguard/` with their key configuration details (Address, AllowedIPs, Endpoint). 
+  Lists all available `.conf` files found in config directory with their key configuration details (Address, AllowedIPs, Endpoint). 
   
   ```bash
   wgc list
@@ -174,9 +192,8 @@ The script requires `sudo` or root access because it manipulates network interfa
 
 ### Command Shortcuts
 
-All commands support prefix matching. For example:
+Some commands support prefix matching. For example:
 
-* `up`, `u` → `up`
 * `nup`, `nu`, `n` → `nup`
 * `down`, `dow`, `do`, `d` → `down`
 * `status`, `stat`, `st`, `s` → `status`
@@ -210,6 +227,8 @@ The script can install its own bash completion file with intelligent suggestions
    * System command completion after `exec <vpn>`
 
 5. To avoid sudo password prompts during completion, the installer provides optional `sudoers` rules.
+
+6. If `WGC_CFGDIR` is changed, the `completion` command must be run again to update its knowledge of the config dir path.
 
 ## Operation Modes Comparison
 
@@ -268,6 +287,26 @@ wgc exec vpn2 bash # then whatever command suits you
 
 ## Troubleshooting
 
+### Custom configuration directory
+
+If you want to use a configuration directory other than `/etc/wireguard/`, set the `WGC_CFGDIR` environment variable:
+
+```bash
+export WGC_CFGDIR=$HOME/.config/wireguard
+wgc list
+```
+
+Make sure the directory:
+
+- Exists and is readable
+- Contains your `.conf` files with appropriate permissions
+- Has the same access rights as `/etc/wireguard/` would have
+
+**Important:** When using `sudo`, environment variables are not always preserved. You can either:
+
+- Add `WGC_CFGDIR` to your sudoers configuration
+- Or the script will automatically pass it through when elevating privileges
+
 ### Config file parsing
 
 The script validates configuration files and reports:
@@ -291,7 +330,7 @@ When stopping a namespace VPN with running processes:
 
 * In namespace mode: DNS is configured in `/etc/netns/<vpn_name>/resolv.conf`
 * In default mode: DNS is set via `resolvectl`
-* Invalid DNS addresses are detected and skipped with warnings
+* Malformed DNS addresses are detected and skipped with warnings
 
 ## License
 

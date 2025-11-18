@@ -17,25 +17,29 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 
-[[ $UID == 0 ]] || exec sudo "$0" "$@"
+[[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" "$0" "$@"
 
 show_usage() {
   cat <<EOF
-Usage: $THIS [ [up|nup|down|status] <vpn> | active | list | exec <vpn> <command> ]
+Usage: $THIS [options] [ [up|upd|nup|down|status] <vpn> | active | list | exec <vpn> <command> ]
 
-<vpn> should match a config file name /etc/wireguard/<vpn>.conf
+<vpn> should match a config file name \$WGC_CFGDIR/<vpn>.conf
+Set and export WGC_CFGDIR to point to dir containing Wireguard *.conf files.
+Default config dir is /etc/wireguard.
 
 Commands (can be shortened):
   up     - Start a VPN
+  upd    - Start a VPN and add a "split route" (0.0.0.0/1 128.0.0.0/1)
   nup    - Start a VPN in its own net namespace
   down   - Stop a VPN
   status - Show VPN status
   active - Show active VPNs
-  list   - List config files in /etc/wireguard/
+  list   - List config files
   exec   - Execute a command in a VPN namespace
-           Example: $THIS <vpn> exec curl ifconfig.me
+           Example: $THIS <vpn> exec curl ipinfo.io
 
 To enable bash completion: $THIS completion
+Redo completion if WGC_CFGDIR is changed.
 EOF
 }
 
@@ -52,20 +56,21 @@ check_dependencies() {
 }
 
 list_config_files() {
-  local f
+  local f g
+  echo -e "Looking in $CFGDIR\n"
   printf "%-12s %-18s %-18s %s\n" "Name" "Address" "AllowedIPs" "Endpoint"
   printf "%-12s %-18s %-18s %s\n" "----" "-------" "----------" "--------"
-  for f in /etc/wireguard/*.conf; do
-    [[ "$f" == "/etc/wireguard/*.conf" ]] && return 0
-    f=${f##*/}; f=${f%.*}
-    [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-    parse_config_file "$f" || return 1
-    printf "%-12s %-18s %-18s %s\n" "$f" "$Address" "$AllowedIPs" "$Endpoint"
+  for f in $CFGDIR/*.conf; do
+    [[ "$f" == "$CFGDIR/*.conf" ]] && return 0
+    g=${f##*/}; g=${g%.*}
+    [[ $g =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
+    parse_config_file "$g"
+    printf "%-12s %-18s %-18s %s\n" "$g" "$Address" "$AllowedIPs" "$Endpoint"
   done
 }
 
 parse_config_file() {
-  local CONFIG_FILE="/etc/wireguard/$1.conf"
+  local CONFIG_FILE="$CFGDIR/$1.conf"
   [[ -f "$CONFIG_FILE" ]] || { echo "$N Config file not found: $CONFIG_FILE"; return 1; }
   [[ -r "$CONFIG_FILE" ]] || { echo "$N Can't read file: $CONFIG_FILE"; return 1; }
   local line n=0 s section key value
@@ -219,7 +224,7 @@ show_active_vpns() {
   echo "Active VPNs in default namespace:"
   for x in $(wg show interfaces); do
     [[ $x =~ wg[0-9]+ ]] && continue
-    [[ -f /etc/wireguard/$x.conf ]] || continue
+    [[ -f $CFGDIR/$x.conf ]] || continue
     if read -r dev x net < <(ip -br -c address show $x 2>/dev/null); then
       found=true
       echo $dev $net
@@ -293,6 +298,11 @@ stop_vpn() {
   else
     [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
       ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
+    local ep
+    ep=($(wg show $DEV endpoints)) && {
+      ep=${ep[1]%%:*}
+      [[ $ep ]] && ip route del $ep &>/dev/null || true
+    } || true
     ip link del $DEV &>/dev/null || true
   fi
   echo "$Y $DEV is now disconnected"
@@ -336,7 +346,7 @@ _wgc_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
   # Main commands
-  commands="up nup down status active list exec"
+  commands="up upd nup down status active list exec"
 
   # Complete the first arg with main commands
   if [[ $COMP_CWORD -eq 1 ]]; then
@@ -348,10 +358,10 @@ _wgc_completion() {
   if [[ $COMP_CWORD -eq 2 ]]; then
     local vpns ns x dev
     case "$prev" in
-      u|up|n|nu|nup)
+      up|upd|n|nu|nup)
         # VPN config file list
         local f
-        for f in $(sudo find /etc/wireguard -maxdepth 1 -name "*.conf" -type f 2>/dev/null); do
+        for f in $(sudo find ${WGC_CFGDIR:-/etc/wireguard} -maxdepth 1 -name "*.conf" -type f 2>/dev/null); do
           f=${f##*/}; f=${f%.*}
           [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
           vpns+="$f "
@@ -468,7 +478,7 @@ start_vpn() {
 
   # Configure WireGuard
   local wgcmd='wg set $DEV'
-  wgcmd+=' listen-port "$ListenPort"'
+  [[ $ListenPort ]] && wgcmd+=' listen-port "$ListenPort"'
   wgcmd+=' private-key <(echo "$PrivateKey")'
   wgcmd+=' peer "$PublicKey"'
   wgcmd+=' allowed-ips "$AllowedIPs"'
@@ -523,7 +533,14 @@ start_vpn() {
       echo "$N Warning: No valid DNS servers configured" >&2
     fi
   else
-    # Add default route valid only for source $Address
+    # Add a "split tunnel route" if wanted
+    $SPLIT_TUNNEL_ROUTE && q=($(ip route get ${Endpoint%%:*} 2>/dev/null)) && {
+      q=${q[@]:0:3}
+      ip route replace $q &>/dev/null && # add specific route to protect WG connection to Endpoint
+        ip route add 0/1 dev $DEV &>/dev/null &&
+          ip route add 128/1 dev &>/dev/null $DEV
+    }
+    # Add default route valid only for source $Address (policy routing)
     for k in {1..251}; do
       [[ $(ip -4 route show table $k 2>/dev/null) ]] || break
     done
@@ -534,6 +551,7 @@ start_vpn() {
     ip -4 route add default dev $DEV table $k
     ip -4 rule add from ${Address%/*} table $k
     # Configure DNS
+    q=
     for k in $DNS; do
       if validate_ipv4 "$k"; then
         q+="$DNS "
@@ -565,7 +583,7 @@ start_vpn() {
     echo
     echo "To run commands in the VPN namespace:"
     echo "  $THIS exec $NAMESPACE <command>"
-    echo "  Example: $THIS exec $NAMESPACE curl ifconfig.me"
+    echo "  Example: $THIS exec $NAMESPACE curl ipinfo.io"
   else
     echo "Routes:"
     ip -c route show | grep -F --color $DEV
@@ -592,19 +610,38 @@ validate_vpn_name() {
 
 # -----------------------------------------------------------------------------
 set +e +x
+unset IFS
 THIS=${0##*/}
 Y=$'\e[01;32m\u2713\e[m' # green CHECK MARK
 N=$'\e[01;31m\u2717\e[m' # red BALLOT X
 
 check_dependencies || exit 1
 
+declare -r CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
+# Validate directory
+if [[ ! -d "$CFGDIR" ]]; then
+  echo "$N Configuration directory not found: $CFGDIR"
+  echo "Set WGC_CFGDIR to point to dir containing Wireguard *.conf files."
+  exit 1
+fi
+if [[ ! -r "$CFGDIR" ]]; then
+  echo "$N Configuration directory found, but not readable: $CFGDIR"
+  echo "Check permissions (e.g., 'sudo chmod o+rX $CFGDIR')."
+  exit 1
+fi
+
 CMD=$1
 DEV=$2
 NAMESPACE=$DEV
+SPLIT_TUNNEL_ROUTE=false
+USE_NAMESPACE=false
 
 case "$CMD" in
-  u|up)
-    USE_NAMESPACE=false
+  up)
+    start_vpn
+    ;;
+  upd)
+    SPLIT_TUNNEL_ROUTE=true
     start_vpn
     ;;
   n|nu|nup)
@@ -624,7 +661,7 @@ case "$CMD" in
     list_config_files
     ;;
   e|ex|exe|exec)
-    shift; shift
+    shift 2
     exec_in_namespace "$@"
     ;;
   completion)
