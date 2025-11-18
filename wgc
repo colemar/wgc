@@ -113,6 +113,7 @@ process_config_line() {
         DNS) DNS=$(extract_all_ipv4 "$value") ;;
         MTU) MTU="$value" ;;
         PrivateKey) PrivateKey="$value" ;;
+        ListenPort) ListenPort="$value" ;;
         *) WARNINGS+="\nUnknown key '$key' in section '$section' at line $n" ;;
       esac
       ;;
@@ -467,6 +468,7 @@ start_vpn() {
 
   # Configure WireGuard
   local wgcmd='wg set $DEV'
+  wgcmd+=' listen-port "$ListenPort"'
   wgcmd+=' private-key <(echo "$PrivateKey")'
   wgcmd+=' peer "$PublicKey"'
   wgcmd+=' allowed-ips "$AllowedIPs"'
