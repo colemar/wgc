@@ -45,12 +45,20 @@ EOF
 
 check_dependencies() {
   local missing=()
-  for cmd in ip wg grep resolvectl mkdir rm ps sleep find; do
+  for cmd in ip wg grep resolvconf mkdir rm ps sleep find; do
     command -v $cmd >/dev/null || missing+=($cmd)
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "$N ERROR: Missing required commands: ${missing[*]}"
-    echo "Install with: apt install wireguard-tools iproute2 grep systemd coreutils procps findutils"
+    echo "Install with: apt install wireguard-tools iproute2 grep coreutils procps findutils openresolv"
+    return 1
+  fi
+}
+
+check_resolvconf_capability() {
+  if [[ ! $(resolvconf -h 2>/dev/null) =~ -x[[:blank:]][[:blank:]A-Za-z]*[[:blank:]]exclusive ]]; then
+    echo "$N ERROR: Your version of 'resolvconf' does not support exclusive mode (-x)." >&2
+    echo "   Please install 'openresolv'." >&2
     return 1
   fi
 }
@@ -295,13 +303,19 @@ stop_vpn() {
     ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
     ip netns del $NAMESPACE &>/dev/null || true
   else
+    # Remove policy routing rule.
     [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
       ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
+    # Remove route protecting Wireguard endpoint
     local ep
     ep=($(wg show $DEV endpoints)) && {
       ep=${ep[1]%%:*}
       [[ $ep ]] && ip route del $ep &>/dev/null || true
     } || true
+    # DNS restore: remove configuration associated with $DEV
+    # If openresolv is missing or fails, proceed anyway
+    resolvconf -d "$DEV" &>/dev/null || true
+    # Remove interface and related things
     ip link del $DEV &>/dev/null || true
   fi
   echo "$Y $DEV is now disconnected"
@@ -465,7 +479,12 @@ start_vpn() {
     return 1
   fi
 
-  $USE_NAMESPACE && NSCMD="ip netns exec $NAMESPACE" || NSCMD=
+  if $USE_NAMESPACE; then
+    NSCMD="ip netns exec $NAMESPACE"
+  else
+    NSCMD=
+    check_resolvconf_capability || return 1
+  fi
 
   clean # Clean slate - removes namespace, interface, DNS config
 
@@ -553,12 +572,17 @@ start_vpn() {
     q=
     for k in $DNS; do
       if validate_ipv4 "$k"; then
-        q+="$DNS "
+        q+="nameserver $k"$'\n'
       else
         echo "$N Warning: Skipping invalid DNS server '$k'" >&2
       fi
     done
-    resolvectl dns $DEV $q
+    if [[ $q ]]; then
+      echo "$q" | resolvconf -a $DEV -x || {
+        echo "$N ERROR: DNS configuration failed." >&2
+        echo "   Ensure 'openresolv' is properly installed and configured." >&2
+      }
+    fi
   fi
 
   echo "$Y VPN connected successfully"
@@ -595,8 +619,8 @@ start_vpn() {
       ip -c route show table $t
     done < <(ip rule list from ${Address%/*})
     echo
-    k=$(resolvectl dns $DEV)
-    echo "DNS:${k#*:}"
+    echo "DNS:"
+    resolvconf -l $DEV
   fi
 }
 

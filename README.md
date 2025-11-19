@@ -30,7 +30,7 @@ Each VPN connection can be brought up in an isolated namespace with its own netw
 * `sudo` access (the script auto-elevates if not run as root) 
 * `wireguard-tools` (provides the `wg` command) 
 * `iproute2` (provides the `ip` command)
-* `systemd` (provides the `resolvectl` command for DNS management)
+* `openresolv` (provides the `resolvconf` command for **exclusive** DNS management to prevent leaks)
 
 ## Installation
 
@@ -76,6 +76,43 @@ The script parses the file and expects standard WireGuard keys:
   * `PresharedKey` 
   * `PersistentKeepalive` 
 
+## DNS Configuration & Requirements
+
+To ensure **zero DNS leaks**, `wgc` relies on the `openresolv` implementation of `resolvconf` (specifically its `-x` exclusive flag).
+
+**Check your installation:**
+Run `resolvconf -h`. If the output mentions `-x ... Mark the interface as exclusive`, you are good to go.
+If the output says "This is a compatibility alias for...", you are using the systemd wrapper, which is **not supported**.
+
+### Installing openresolv
+
+**Debian / Ubuntu 22.04 and older:**
+
+```bash
+sudo apt update && sudo apt install openresolv
+```
+
+**Ubuntu 24.04+ (Noble) and newer:** Canonical has removed `openresolv` from the official repositories. You must install it manually:
+
+1. Download the package (from Debian or older Ubuntu archives):
+   
+   ```bash
+   wget http://ftp.debian.org/debian/pool/main/o/openresolv/openresolv_3.13.2-1_all.deb
+   ```
+
+2. Install it (ignoring conflicts with systemd-resolved):
+   
+   ```bash
+   sudo dpkg -i --force-conflicts openresolv_*.deb
+   ```
+
+3. Configure it to use systemd as the fallback DNS (to keep internet working when VPN is off):
+   
+   ```bash
+   echo "name_servers=127.0.0.53" | sudo tee -a /etc/resolvconf.conf
+   sudo resolvconf -u
+   ```
+
 ---
 
 ## Usage
@@ -107,6 +144,8 @@ The script requires `sudo` or root access because it manipulates network interfa
   This means that any application will have its network traffic routed through the VPN tunnel.
   
   This also means that if you are connected via ssh your session will be terminated, unless before starting the VPN you manually add a specific route to your ip address.
+  
+  **Important (DNS):** To prevent privacy leaks, **DNS resolution is switched globally** to the VPN's DNS server. This means that even applications using your normal internet connection (not bound to the VPN) will rely on the active VPN tunnel to resolve domain names.
   
   ```bash
   wgc upd proton-it
@@ -232,13 +271,14 @@ The script can install its own bash completion file with intelligent suggestions
 
 ## Operation Modes Comparison
 
-| Feature           | Default Namespace (`up`)              | Isolated Namespace (`nup`) |
-| ----------------- | ------------------------------------- | -------------------------- |
-| Network isolation | Partial (routing rules).              | Complete.                  |
-| DNS configuration | System-wide.                          | Namespace-specific.        |
-| Process execution | Direct.                               | Via `wgc exec`.            |
-| Multiple VPNs     | Possible, with distinct ip addresses. | Simple and clean.          |
-| Use case          | System-wide VPN.                      | Application-specific VPN.  |
+| Feature           | Default Namespace (`up`)              | Isolated Namespace (`nup`)             |
+| ----------------- | ------------------------------------- | -------------------------------------- |
+| Network isolation | Partial (routing rules).              | Complete.                              |
+| DNS configuration | System-wide.                          | Namespace-specific.                    |
+| Process execution | Direct.                               | Via `wgc exec`.                        |
+| Multiple VPNs     | Possible, with distinct ip addresses. | Simple and clean.                      |
+| Use case          | System-wide VPN.                      | Application-specific VPN.              |
+| **DNS scope**     | **System-wide** (Overrides host DNS). | **Isolated** (Affects only namespace). |
 
 ## Examples
 
@@ -328,9 +368,10 @@ When stopping a namespace VPN with running processes:
 
 ### DNS issues
 
-* In namespace mode: DNS is configured in `/etc/netns/<vpn_name>/resolv.conf`
-* In default mode: DNS is set via `resolvectl`
-* Malformed DNS addresses are detected and skipped with warnings
+* **DNS Leaks (Default Mode):** When running in the default namespace (`up`/`upd`), `wgc` requires `openresolv` to guarantee exclusive DNS priority. Standard `systemd-resolved` wrappers usually lack the true exclusive mode (`-x`), leading to DNS leaks. **This requirement does not apply to namespace mode (`nup`).**
+* **DNS in Namespace Mode:** DNS is configured directly in `/etc/netns/<vpn_name>/resolv.conf` without external tools.
+* **DNS in Default Mode:** DNS is managed via `resolvconf -x`, which registers the VPN DNS with **exclusive priority**. Depending on your system configuration, this effectively overrides other DNS settings either by communicating with the system resolver (e.g., `systemd-resolved`) or by updating `/etc/resolv.conf` directly.
+* Malformed DNS addresses in `.conf` files are detected and skipped with warnings.
 
 ## License
 
