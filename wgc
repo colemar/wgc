@@ -164,7 +164,6 @@ is_connected() {
   if [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]]; then
     DEV_ADDR=${BASH_REMATCH[0]}
     IN_NAMESPACE=false
-    NAMESPACE=default
     return 0
   fi
   if [[ $(ip netns exec $NAMESPACE ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]]; then
@@ -429,7 +428,7 @@ Completion will be automatically available in new shell sessions.
 To avoid sudo password prompt:
   sudo visudo -f /etc/sudoers.d/wgc-completion
   Then add:
-  %sudo ALL=(ALL) NOPASSWD: /usr/bin/find /etc/wireguard/ -maxdepth 1 -name *.conf -type f
+  %sudo ALL=(ALL) NOPASSWD: /usr/bin/find $CFGDIR -maxdepth 1 -name *.conf -type f
   %sudo ALL=(ALL) NOPASSWD: /usr/sbin/ip netns list
   %sudo ALL=(ALL) NOPASSWD: /usr/sbin/ip netns exec * wg show *
 EOF
@@ -635,17 +634,18 @@ DEV=$2
 NAMESPACE=$DEV
 SPLIT_TUNNEL_ROUTE=false
 USE_NAMESPACE=false
+declare -r CMD DEV NAMESPACE
 
 case "$CMD" in
   up)
     start_vpn
     ;;
   upd)
-    SPLIT_TUNNEL_ROUTE=true
+    declare -r SPLIT_TUNNEL_ROUTE=true
     start_vpn
     ;;
   n|nu|nup)
-    USE_NAMESPACE=true
+    declare -r USE_NAMESPACE=true
     start_vpn
     ;;
   d|do|dow|down)
