@@ -164,7 +164,7 @@ The script requires `sudo` or root access because it manipulates network interfa
   wgc exec proton-it curl ipinfo.io
   ```
   
-    *Example: Start an interactive shell that uses the VPN.*
+    *Example: Start an interactive shell that only sees the VPN network.*
   
   ```bash
   wgc exec proton-it bash
@@ -224,7 +224,7 @@ The script can install its own bash completion file with intelligent suggestions
    * Command name completion
    * VPN name completion based on available config files (for `up`/`nup`)
    * Active VPN completion (for `down`/`status`/`exec`)
-   * System command completion after `exec <vpn>`
+   * System command completion after `exec <vpn>` (Note: Issuing a double TAB without providing a command prefix to narrow the search results in a significant delay)
 
 5. To avoid sudo password prompts during completion, the installer provides optional `sudoers` rules.
 
