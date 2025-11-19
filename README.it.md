@@ -131,7 +131,7 @@ Lo script richiede accesso `sudo` o root perché manipola interfacce di rete e n
   * Se la VPN è attiva nel namespace predefinito (avviata con `up/upd`), la arresta.
   * Se la VPN è attiva nel suo namespace (avviata con `nup`):
     * Se non ci sono processi in esecuzione nello stesso namespace, arresta la VPN.
-    * Se ci sono processi in esecuzione nello stesso namespace, mostra l'elenco dei processi e rifiuta di arrestare la VPN. Se specifichi `force`, termina controlladamente tutti i processi nel namespace (SIGTERM), attende fino a 10 secondi con una barra di progresso, poi uccide forzatamente i processi rimanenti (SIGKILL). Infine, arresta la VPN.
+    * Se ci sono processi in esecuzione nello stesso namespace, mostra l'elenco dei processi e rifiuta di arrestare la VPN. Se specifichi `force`, termina in maniera controllata tutti i processi nel namespace (SIGTERM), attende fino a 10 secondi mostrando una barra di progresso, poi uccide forzatamente i processi rimanenti (SIGKILL). Infine, arresta la VPN.
   
   ```bash
   wgc down proton-it
@@ -164,7 +164,7 @@ Lo script richiede accesso `sudo` o root perché manipola interfacce di rete e n
   wgc exec proton-it curl ipinfo.io
   ```
   
-    *Esempio: Avvia una shell interattiva che utilizza la VPN.*
+    *Esempio: Avvia una shell interattiva che vede solamente la rete VPN.*
   
   ```bash
   wgc exec proton-it bash
@@ -173,7 +173,7 @@ Lo script richiede accesso `sudo` o root perché manipola interfacce di rete e n
   ![](images/exec.png)
 
 * **`list`**
-  Elenca tutti i file `.conf` disponibili trovati nella directory di configurazione con i loro dettagli chiave di configurazione (Address, AllowedIPs, Endpoint). 
+  Elenca tutti i file `.conf` disponibili trovati nella directory di configurazione con i loro dettagli chiave (Address, AllowedIPs, Endpoint). 
   
   ```bash
   wgc list
@@ -224,7 +224,7 @@ Lo script può installare il proprio file di completamento bash con suggerimenti
    * Completamento dei nomi dei comandi
    * Completamento dei nomi VPN basato sui file di configurazione disponibili (per `up`/`nup`)
    * Completamento delle VPN attive (per `down`/`status`/`exec`)
-   * Completamento dei comandi di sistema dopo `exec <vpn>`
+   * Completamento dei comandi di sistema dopo `exec <vpn>` (nota: inviare doppio TAB, senza avere fornito almeno un carattere per restringere la ricerca dei comandi, causa un ritardo notevole)
 
 5. Per evitare richieste di password sudo durante il completamento, l'installatore fornisce regole `sudoers` opzionali.
 
