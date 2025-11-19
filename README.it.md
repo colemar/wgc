@@ -30,7 +30,7 @@ Ogni connessione VPN può essere attivata in un namespace isolato con la propria
 * Accesso `sudo` (lo script si auto-eleva se non eseguito come root) 
 * `wireguard-tools` (fornisce il comando `wg`) 
 * `iproute2` (fornisce il comando `ip`)
-* `systemd` (fornisce il comando `resolvectl` per la gestione DNS)
+* `openresolv` (fornisce il comando `resolvconf` per la gestione **esclusiva** dei DNS per prevenire leak)
 
 ## Installazione
 
@@ -76,6 +76,43 @@ Lo script analizza il file e si aspetta le chiavi standard di WireGuard:
   * `PresharedKey` 
   * `PersistentKeepalive` 
 
+## Configurazione DNS e Requisiti
+
+Per garantire **zero DNS leaks**, `wgc` si affida all'implementazione `openresolv` di `resolvconf` (specificamente al suo flag esclusivo `-x`).
+
+**Verifica la tua installazione:**
+Esegui `resolvconf -h`. Se l'output menziona `-x ... Mark the interface as exclusive`, sei a posto.
+Se l'output dice "This is a compatibility alias for...", stai usando il wrapper di systemd, che **non è supportato**.
+
+### Installazione di openresolv
+
+**Debian / Ubuntu 22.04 e precedenti:**
+
+```bash
+sudo apt update && sudo apt install openresolv
+```
+
+**Ubuntu 24.04+ (Noble) e successivi:** Canonical ha rimosso openresolv dai repository ufficiali. Devi installarlo manualmente:
+
+1. Scarica il pacchetto (da archivi Debian o Ubuntu precedenti):
+
+```bash
+wget http://ftp.debian.org/debian/pool/main/o/openresolv/openresolv_3.13.2-1_all.deb
+```
+
+2. Installalo (ignorando i conflitti con systemd-resolved):
+
+```bash
+sudo dpkg -i --force-conflicts openresolv_*.deb
+```
+
+3. Configuralo per usare systemd come DNS di fallback (per mantenere internet funzionante quando la VPN è spenta):
+
+```bash
+echo "name_servers=127.0.0.53" | sudo tee -a /etc/resolvconf.conf
+sudo resolvconf -u
+```
+
 ---
 
 ## Utilizzo
@@ -91,9 +128,11 @@ Lo script richiede accesso `sudo` o root perché manipola interfacce di rete e n
 * **`up <vpn>`**
   Avvia la connessione VPN nel **namespace predefinito** utilizzando routing basato su policy. Le route della VPN sono applicate in base all'indirizzo sorgente, permettendo alla VPN di coesistere con la tua normale connessione di rete.
   
-  Questo significa che un'applicazione (es. qBittorrent) deve essere associata all'interfaccia VPN o all'indirizzo ip per avere il suo traffico di rete reindirizzato attraverso il tunnel.
+  Questo significa che un'applicazione (es. qBittorrent) deve essere associata (bind) all'interfaccia VPN o all'indirizzo ip per avere il suo traffico di rete reindirizzato attraverso il tunnel.
   
   Questo significa anche che se sei connesso via ssh, la tua sessione non si chiuderà quando avvii la VPN.
+
+  **Importante (DNS):** Per prevenire leak della privacy, **la risoluzione DNS viene commutata globalmente** sul server DNS della VPN. Questo significa che anche le applicazioni che utilizzano la normale connessione internet (non vincolate alla VPN) si affideranno al tunnel VPN attivo per risolvere i nomi di dominio.
   
   ```bash
   wgc up proton-it
@@ -232,13 +271,13 @@ Lo script può installare il proprio file di completamento bash con suggerimenti
 
 ## Confronto Modalità di Funzionamento
 
-| Caratteristica        | Namespace Predefinito (`up`)             | Namespace Isolato (`nup`) |
-| --------------------- | ---------------------------------------- | ------------------------- |
-| Isolamento di rete    | Parziale (regole di routing).            | Completo.                 |
-| Configurazione DNS    | A livello di sistema.                    | Specifica del namespace.  |
-| Esecuzione processi   | Diretta.                                 | Tramite `wgc exec`.       |
-| VPN multiple          | Possibile, con indirizzi ip distinti.    | Semplice e pulito.        |
-| Caso d'uso            | VPN a livello di sistema.                | VPN specifica per app.    |
+| Caratteristica        | Namespace Predefinito (`up`)                            | Namespace Isolato (`nup`)                  |
+| --------------------- | ------------------------------------------------------- | ------------------------------------------ |
+| Isolamento di rete    | Parziale (regole di routing).                           | Completo.                                  |
+| Esecuzione processi   | Diretta.                                                | Tramite `wgc exec`.                        |
+| VPN multiple          | Possibile, con indirizzi ip distinti.                   | Semplice e pulito.                         |
+| Caso d'uso            | VPN a livello di sistema.                               | VPN specifica per app.                     |
+| **Ambito DNS**        | **A livello di sistema** (Sovrascrive i DNS dell'host). | **Isolato** (Influenza solo il namespace). |
 
 ## Esempi
 
@@ -328,8 +367,9 @@ Quando si arresta una VPN in namespace con processi in esecuzione:
 
 ### Problemi DNS
 
-* In modalità namespace: il DNS è configurato in `/etc/netns/<nome_vpn>/resolv.conf`
-* In modalità predefinita: il DNS è impostato tramite `resolvectl`
+* **DNS Leaks (Modalità Predefinita):** Quando si esegue nel namespace predefinito (`up`/`upd`), `wgc` richiede `openresolv` per garantire la priorità esclusiva dei DNS. I wrapper standard di `systemd-resolved` mancano solitamente della vera modalità esclusiva (`-x`), portando a leak DNS. **Questo requisito non si applica alla modalità namespace (`nup`).**
+* **DNS in Modalità Namespace:** Il DNS è configurato direttamente in `/etc/netns/<nome_vpn>/resolv.conf` senza strumenti esterni.
+* **DNS in Modalità Predefinita:** Il DNS è gestito tramite `resolvconf -x`, che registra il DNS della VPN con **priorità esclusiva**. A seconda della configurazione del sistema, questo sovrascrive efficacemente le altre impostazioni DNS comunicando con il resolver di sistema (es. `systemd-resolved`) o aggiornando direttamente `/etc/resolv.conf`.
 * Gli indirizzi DNS malformati vengono rilevati e saltati con avvertimenti
 
 ## Licenza
