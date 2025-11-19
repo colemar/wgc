@@ -57,7 +57,7 @@ export WGC_CFGDIR=/path/to/your/configs
 wgc list
 ```
 
-The script uses the filename (without the `.conf` extension) as the VPN identifier. For example, a file at `/etc/wireguard/proton-it.conf` will be managed as the `proton-it` VPN.
+The script uses the filename (without the `.conf` extension) as the VPN identifier. For example, a file at `$WGC_CFGDIR/proton-it.conf` will be managed as the `proton-it` VPN.
 
 **Note:** Config files named with the pattern `wg[0-9]+` (e.g., `wg0.conf`, `wg1.conf`) are excluded from management to avoid conflicts with system interfaces.
 
@@ -117,7 +117,7 @@ The script requires `sudo` or root access because it manipulates network interfa
   
   A default route (0.0.0.0/0) will be added for the VPN tunnel, so any application will have its network traffic routed through it.
   
-  **Note:** Applications with network listeners (e.g., web interfaces on TCP ports) will be unreachable from outside the namespace unless you configure port forwarding. Applications with GUI or terminal interfaces remain fully accessible.
+  **Note:** Applications with network listeners (e.g., web interfaces on TCP ports) will be unreachable from outside the VPN namespace unless you set up port forwarding (built in support coming soon) or a *veth* (virtual ethernet) connecting the default namespace with the VPN namespace.  Applications with GUI or terminal interfaces remain fully accessible.
   
   ```bash
   wgc nup proton-it
@@ -252,7 +252,7 @@ wgc nup proton-it
 wgc exec proton-it firefox
 
 # When done, stop the VPN (will ask to force if Firefox is running)
-wgc down proton-it force
+wgc down proton-it
 ```
 
 ### Checking VPN connectivity

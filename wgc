@@ -286,7 +286,7 @@ stop_vpn() {
         kill_processes "$pids"
       else
         echo -e "$N Processes running in namespace $NAMESPACE:\n$(ps -fp $pids)\n"
-        echo "Force stop (killing processes) with: $THIS stop $DEV force"
+        echo "Force stop (killing processes) with: $THIS down $DEV force"
         return
       fi
     fi
