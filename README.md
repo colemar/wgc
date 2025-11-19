@@ -156,7 +156,7 @@ The script requires `sudo` or root access because it manipulates network interfa
   
   A default route (0.0.0.0/0) will be added for the VPN tunnel, so any application will have its network traffic routed through it.
   
-  **Note:** Applications with network listeners (e.g., web interfaces on TCP ports) will be unreachable from outside the VPN namespace unless you set up port forwarding (built in support coming soon) or a *veth* (virtual ethernet) connecting the default namespace with the VPN namespace.  Applications with GUI or terminal interfaces remain fully accessible.
+  **Note:** Applications with network listeners (e.g., web interfaces on TCP ports) running in the isolated namespace will be unreachable from outside the VPN namespace unless you set up port forwarding (built in support coming soon) or a *veth* (virtual ethernet) connecting the default namespace with the VPN namespace.  Applications with GUI or terminal interfaces remain fully accessible.
   
   ```bash
   wgc nup proton-it
@@ -274,7 +274,6 @@ The script can install its own bash completion file with intelligent suggestions
 | Feature           | Default Namespace (`up`)              | Isolated Namespace (`nup`)             |
 | ----------------- | ------------------------------------- | -------------------------------------- |
 | Network isolation | Partial (routing rules).              | Complete.                              |
-| DNS configuration | System-wide.                          | Namespace-specific.                    |
 | Process execution | Direct.                               | Via `wgc exec`.                        |
 | Multiple VPNs     | Possible, with distinct ip addresses. | Simple and clean.                      |
 | Use case          | System-wide VPN.                      | Application-specific VPN.              |
