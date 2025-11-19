@@ -132,6 +132,8 @@ The script requires `sudo` or root access because it manipulates network interfa
   
   This also means that if you are connected via ssh, your session will not close when you start the VPN.
   
+  **Important (DNS):** To prevent privacy leaks, **DNS resolution is switched globally** to the VPN's DNS server. This means that even applications using your normal internet connection (not bound to the VPN) will rely on the active VPN tunnel to resolve domain names.
+  
   ```bash
   wgc up proton-it
   ```
@@ -144,8 +146,6 @@ The script requires `sudo` or root access because it manipulates network interfa
   This means that any application will have its network traffic routed through the VPN tunnel.
   
   This also means that if you are connected via ssh your session will be terminated, unless before starting the VPN you manually add a specific route to your ip address.
-  
-  **Important (DNS):** To prevent privacy leaks, **DNS resolution is switched globally** to the VPN's DNS server. This means that even applications using your normal internet connection (not bound to the VPN) will rely on the active VPN tunnel to resolve domain names.
   
   ```bash
   wgc upd proton-it
