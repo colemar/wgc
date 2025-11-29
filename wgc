@@ -17,8 +17,6 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 
-[[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" "$0" "$@"
-
 show_usage() {
   cat <<EOF
 Usage: wgc [options] [ [up|upd|nup|down|status] <vpn> | active | list | exec <vpn> <command> ]
@@ -43,17 +41,6 @@ Redo completion if WGC_CFGDIR is changed.
 EOF
 }
 
-check_dependencies() {
-  local missing=()
-  for cmd in ip wg grep resolvconf mkdir rm ps sleep find curl sed; do
-    command -v $cmd >/dev/null || missing+=($cmd)
-  done
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    error "Missing required commands: ${missing[*]}
-           Install with: apt install wireguard-tools iproute2 grep sed coreutils procps findutils openresolv" fatal blameparent
-  fi
-}
-
 set_markers() {
   Y=$'\u2713'
   X=$'\u274C'
@@ -64,26 +51,60 @@ set_markers() {
     X=$'\e[01;31m'$X$'\e[m' # red CROSS MARK
     W=$'\e[01;31m'$W$'\e[m' # red BALLOT X
   fi
+  declare -gr W X Y
 }
 
-check_resolvconf_capability() {
-  if [[ ! $(resolvconf -h 2>/dev/null) =~ -x[[:blank:]][[:blank:].A-Za-z]*[[:blank:]]exclusive ]]; then
-    local tailmsg=
-    [[ -d /run/systemd/resolve ]] && tailmsg+="
-      This system has systemd-resolved.
-      To bypass debian package conflict with openresolv use 'wgc openresolv' instead of 'apt-get install openresolv'."
+set_cfgdir() {
+  declare -gr CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
+  # Validate directory
+  [[ ! -d "$CFGDIR" ]] && \
+    error "Configuration directory not found: $CFGDIR
+          Set WGC_CFGDIR to point to dir containing Wireguard *.conf files." fatal
+  [[ ! -r "$CFGDIR" ]] && \
+    error "Configuration directory found, but not readable: $CFGDIR
+          Check permissions (e.g., 'sudo chmod o+rX $CFGDIR')." fatal
+  return 0
+}
+
+check_dependencies() {
+  local missing=()
+  for cmd in ip wg grep resolvconf mkdir rm ps sleep find curl sed setpriv; do
+    command -v $cmd >/dev/null || missing+=($cmd)
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    error "Missing required commands: ${missing[*]}
+           Install with: apt install wireguard-tools iproute2 grep sed coreutils procps findutils openresolv util-linux" fatal blameparent
+  fi
+}
+
+has_openresolv() {
+  [[ $(resolvconf -h 2>/dev/null) =~ -x[[:blank:]][[:blank:].A-Za-z]*[[:blank:]]exclusive ]]
+}
+
+check_openresolv() {
+  if ! has_openresolv; then
+    local tailmsg='Please run: apt-get install openresolv'
+    [[ -d /run/systemd/resolve ]] && tailmsg="This system has systemd-resolved.
+      To bypass debian package conflict with openresolv run 'wgc openresolv' instead of 'apt-get install openresolv'.
+      To remove openresolv installed by wgc run 'wgc remopenresolv'."
     error "Your version of 'resolvconf' does not support exclusive mode (-x).
-           Please install 'openresolv'.$tailmsg" fatal blameparent
+           $tailmsg" fatal blameparent
   fi
 }
 
 install_forced_openresolv() {
+  has_openresolv && error "Openresolv is already installed ('resolvconf' supports exclusive mode -x)." fatal
+
+  [[ -L /usr/sbin/resolvconf ]] ||
+    error "Systemd-resolved symlink wrapper for 'resolvconf' NOT detected. Standard installation is possible.
+           Please install 'openresolv' using: sudo apt-get install openresolv" fatal
+
   echo "Forcing openresolv installation..."
 
-  if ! dpkg-divert --list | grep -q "/usr/sbin/resolvconf"; then
+  dpkg-divert --list | grep "/usr/sbin/resolvconf" > /dev/null || {
     echo "Diversion of resolvconf binary..."
     dpkg-divert --divert /usr/sbin/resolvconf.systemd --rename --add /usr/sbin/resolvconf
-  fi
+  }
 
   local TEMP_DIR=$(mktemp -d)
   mkdir -p "$TEMP_DIR"
@@ -93,7 +114,7 @@ install_forced_openresolv() {
     echo "Download via APT successful."
   else
     echo "APT download failed (package likely missing)."
-    local BASE_URL="http://ftp.debian.org/debian/pool/main/o/openresolv/"
+    local BASE_URL="https://ftp.debian.org/debian/pool/main/o/openresolv/"
     echo "Attempting direct Debian Pool download from $BASE_URL ..."
 
     # Find latest .deb file: openresolv_X.X.X-X_all.deb
@@ -113,15 +134,16 @@ install_forced_openresolv() {
 
   local DEB_FILE=$(find . -name "openresolv*.deb" | head -n 1)
 
-  echo "Extracting $DEB_FILE..."
-  dpkg-deb -x "$DEB_FILE" extracted_pkg
-
   echo "Creating file manifest..."
   mkdir -p /etc/wwggcc
-  find extracted_pkg -type f | sed 's|^extracted_pkg||' > /etc/wwggcc/openresolv.files
 
-  echo "Copying files to system..."
-  cp -R extracted_pkg/* /
+  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tf - | grep -v '/$' | sed 's|^./|/|' > /etc/wwggcc/openresolv.files
+
+  echo "Extracting directly to system..."
+  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar --keep-directory-symlink -xC /
+
+  cd ..
+  rm -rf "$TEMP_DIR"
 
   echo "Detecting DNS backend..."
   if [[ -d /run/systemd/resolve ]]; then
@@ -140,11 +162,8 @@ install_forced_openresolv() {
     echo "Systemd-resolved NOT detected. Leaving standard configuration."
   fi
 
-  cd ..
-  rm -rf "$TEMP_DIR"
-
   echo "Regenerating resolvconf..."
-  resolvconf -u
+  /sbin/resolvconf -u
 
   if command -v mandb >/dev/null; then
     echo "Updating the manual page index caches..."
@@ -156,9 +175,17 @@ install_forced_openresolv() {
 }
 
 remove_openresolv() {
-  local MANIFEST="/etc/wwggcc/openresolv.files"
+  local MANIFEST=/etc/wwggcc/openresolv.files
 
   echo "Removing openresolv..."
+
+  dpkg-divert --list | grep "/usr/sbin/resolvconf" > /dev/null ||
+    error "No package diversion found. Assuming standard APT management.
+           To uninstall 'openresolv', please use: sudo apt remove openresolv" fatal
+
+  echo "Removing diversion of resolvconf binary..."
+  rm -f /usr/sbin/resolvconf
+  dpkg-divert --rename --remove /usr/sbin/resolvconf
 
   if [[ -f "$MANIFEST" ]]; then
     echo "Deleting installed files..."
@@ -173,36 +200,37 @@ remove_openresolv() {
 
   rmdir /usr/lib/resolvconf 2>/dev/null || true
 
-  # 3. Gestione Diversion (Il cuore del ripristino)
-  echo "Restoring systemd-resolved wrapper..."
-
-  if [[ -f /usr/sbin/resolvconf ]] && [[ ! -L /usr/sbin/resolvconf ]]; then
-     rm /usr/sbin/resolvconf
+  echo "Restoring systemd-resolved symlink /etc/resolv.conf..."
+  if [[ -f /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
+    rm -f /etc/resolv.conf
+    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
   fi
 
-  if dpkg-divert --list | grep -q "/usr/sbin/resolvconf"; then
-    dpkg-divert --rename --remove /usr/sbin/resolvconf
-  else
-    echo "Diversion not found, trying explicit reinstall of systemd-resolved..."
-    apt-get install --reinstall -y systemd-resolved
-  fi
+  echo "Restoring systemd-resolved resolvconf symlink wrapper..."
+  rm -f /usr/sbin/resolvconf
+  ln -sf /usr/bin/resolvectl /usr/sbin/resolvconf
 
-  command -v mandb >/dev/null && mandb -pq
+  if command -v mandb >/dev/null; then
+    echo "Updating the manual page index caches..."
+    mandb -pq
+  fi
 
   echo "Done. System returned to APT management."
 }
 
 list_config_files() {
   local f= g=
+  set_cfgdir
   echo -e "Looking in $CFGDIR\n"
-  printf "%-12s %-18s %-26s %s\n" "Name" "Address" "Endpoint" "AllowedIPs"
-  printf "%-12s %-18s %-26s %s\n" "----" "-------" "--------" "----------"
+  printf "%-12s %-18s %-29s %s\n" "Name" "Address" "Endpoint" "AllowedIPs"
+  printf "%-12s %-18s %-29s %s\n" "----" "-------" "--------" "----------"
   for f in $CFGDIR/*.conf; do
     [[ "$f" == "$CFGDIR/*.conf" ]] && return 0
     g=${f##*/}; g=${g%.*}
     [[ $g =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
     parse_config_file "$g" relax || continue
-    printf "%-12s %-18s %-26s %s\n" "$g" "$Address" "$Endpoint" "$AllowedIPs"
+    (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
+    printf "%-12s %-18s %-29s %s\n" "$g" "$Address" "$Endpoint" "$AllowedIPs"
   done
 }
 
@@ -365,6 +393,7 @@ show_status() {
 
 show_active_vpns() {
   local x= ns= dev= net= found=false
+  set_cfgdir
   echo
   echo "Active VPNs in default namespace:"
   for x in $(wg show interfaces); do
@@ -456,12 +485,51 @@ stop_vpn() {
   echo "$Y VPN $DEV is now disconnected"
 }
 
+is_valid_ident() {
+  local "$1" &>/dev/null
+}
+
 exec_in_namespace() {
   validate_vpn_name
   [[ $# -eq 0 ]] && { error "No command specified"; show_usage; exit 1; }
-  is_connected || error "VPN $DEV is not connected. Start it first with: wgc nstart $DEV" fatal
+  is_connected || error "VPN $DEV is not connected. Start it first with: wgc nup $DEV" fatal
   [[ $IN_NAMESPACE ]] || error "VPN $DEV is not in its own namespace. Just use plain command: $@" fatal
-  exec ip netns exec $NAMESPACE sudo -u "${SUDO_USER:-$USER}" "$@"
+
+  if [[ $(</proc/$PPID/comm) == sudo ]]; then
+    # wgc auto-elevated or executed with sudo.
+    # sudo inherits and sanitizes the original environment (depending on the active security policy) before executing wgc.
+    local grandpa_pid var_eq_val var
+
+    command -v setpriv >/dev/null || error "Missing command 'setpriv'" fatal
+    [[ $SUDO_UID ]] || error "Unable to determine invoking user (SUDO_UID missing)" fatal
+
+    # Retrieve the Grandparent PID (field 4 of parent's stat).
+    # This identifies the correct source for the unsanitized environment:
+    # 1. Modern sudo (PTY mode): It targets the main sudo process (which holds the original env).
+    # 2. Legacy sudo: It targets the invoking shell directly.
+    # In both cases, reading this PID's environ bypasses the sanitization applied by the direct parent.
+    read -r _ _ _ grandpa_pid _ < /proc/$PPID/stat # get sudo pid
+    # Build the environment for the final command
+    local -a FINAL_ENV
+    while IFS= read -r -d '' var_eq_val; do
+      var=${var_eq_val%%=*}
+      [[ $var == @(PWD|_) ]] && continue
+      FINAL_ENV+=("$var_eq_val")
+    done < /proc/$grandpa_pid/environ
+
+    # Append the actual current PWD.
+    # wgc inherited the correct working directory from sudo (whether preserved or changed via sudo -i),
+    # so $PWD holds the authoritative value.
+    FINAL_ENV+=("PWD=$PWD")
+
+    # Final command
+    exec ip netns exec $NAMESPACE \
+         setpriv --reuid $SUDO_UID --regid $SUDO_GID --init-groups \
+         env -i "${FINAL_ENV[@]}" "$@"
+  else
+    # wgc executed by root
+    exec ip netns exec $NAMESPACE "$@"
+  fi
 }
 
 validate_ipv4_kern() {
@@ -605,7 +673,14 @@ clean_vpn() {
 
 start_vpn() {
 
-  local k= q= t=
+  local arg= split_tunnel_route=false use_namespace=false k= q= t=
+
+  for arg in "${@}"; do
+    case $arg in
+      split_tunnel_route) split_tunnel_route=true ;;
+      use_namespace) use_namespace=true ;;
+    esac
+  done
 
   validate_vpn_name
 
@@ -613,14 +688,16 @@ start_vpn() {
     error "$DEV is already connected in namespace ${IN_NAMESPACE:-default}
            To reconnect, first stop it: wgc down $DEV" fatal
 
+  set_cfgdir
+
   # get parameters from config file named $DEV
   parse_config_file $DEV
 
-  if $USE_NAMESPACE; then
+  if $use_namespace; then
     NSCMD="ip netns exec $NAMESPACE"
   else
     NSCMD=
-    check_resolvconf_capability
+    check_openresolv
   fi
 
   push_cleanup clean_vpn # Clean slate - removes namespace, interface, DNS config
@@ -645,7 +722,7 @@ start_vpn() {
     error " " fatal
   }
 
-  $USE_NAMESPACE && {
+  $use_namespace && {
     # Create and configure namespace
     ip netns add $NAMESPACE || error "Failed to create namespace '$NAMESPACE'" fatal
     ip link set $DEV netns $NAMESPACE || error "Failed to move interface '$DEV' to namespace '$NAMESPACE'" fatal
@@ -660,7 +737,7 @@ start_vpn() {
 
   # (let trap catch some fatal errors and report failed command)
 
-  if $USE_NAMESPACE; then
+  if $use_namespace; then
     # Add default route
     $NSCMD ip route add default dev $DEV
     # Configure DNS
@@ -681,7 +758,7 @@ start_vpn() {
     fi
   else
     # Add a "split tunnel route" if wanted
-    $SPLIT_TUNNEL_ROUTE && q=($(ip route get ${Endpoint%%:*} 2>/dev/null)) && {
+    $split_tunnel_route && q=($(ip route get ${Endpoint%%:*} 2>/dev/null)) && {
       # Add specific route to protect WireGuard UDP Stateless Tunnel to Endpoint
       ip route replace ${q[@]:0:3}
       ip route add 0/1 dev $DEV
@@ -714,14 +791,14 @@ start_vpn() {
   echo
   $NSCMD wg show $DEV
   echo
-  $USE_NAMESPACE && {
+  $use_namespace && {
     echo "Network namespace: $NAMESPACE"
     echo
   }
   echo "Interface details:"
   $NSCMD ip -c addr show $DEV
   echo
-  if $USE_NAMESPACE; then
+  if $use_namespace; then
     echo "Routes:"
     $NSCMD ip -c route show
     echo
@@ -836,8 +913,8 @@ error() {
     exit 1
   fi
 
-  [[ -n "$original_trap" ]] && eval "$original_trap"
-  [[ "$original_opts" == *e* ]] && set -e
+  [[ $original_trap ]] && eval "$original_trap"
+  [[ $original_opts == *e* ]] && set -e
   return 0 # allow to use error() as soft error handler without adding ||true to avoid trap ERR and recursion
 }
 
@@ -863,44 +940,35 @@ indent_multiline() {
 }
 
 # -----------------------------------------------------------------------------
-set_markers
-set -e +x
-set -u          # Treat unset variables as an error.
-set -o pipefail # Return value of a pipeline is the status of the last command to exit with a non-zero status.
-set -o errtrace # Trap ERR is inherited by functions.
-trap 'error TRAP fatal' ERR
-shopt -s extglob # Enable extended glob patterns: x(y)
-unset IFS
-
-check_dependencies
-
-declare -r CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
-# Validate directory
-[[ ! -d "$CFGDIR" ]] && \
-  error "Configuration directory not found: $CFGDIR
-         Set WGC_CFGDIR to point to dir containing Wireguard *.conf files." fatal
-[[ ! -r "$CFGDIR" ]] && \
-  error "Configuration directory found, but not readable: $CFGDIR
-         Check permissions (e.g., 'sudo chmod o+rX $CFGDIR')." fatal
+[[ $1 == trace ]] && { set -x; shift; }
 
 CMD=${1:-}
 DEV=${2:-}
+
+[[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" "$0" "$@"
+
+set -e
+set -u          # Treat unset variables as an error.
+set -o pipefail # Return value of a pipeline is the status of the last command to exit with a non-zero status.
+set -o errtrace # Trap ERR is inherited by functions.
+shopt -s extglob # Enable extended glob patterns: x(y)
+unset IFS
+
 NAMESPACE=$DEV
-SPLIT_TUNNEL_ROUTE=false
-USE_NAMESPACE=false
 declare -r CMD DEV NAMESPACE
+
+set_markers
+trap 'error TRAP fatal' ERR
 
 case "$CMD" in
   up)
     start_vpn
     ;;
   upd)
-    declare -r SPLIT_TUNNEL_ROUTE=true
-    start_vpn
+    start_vpn split_tunnel_route
     ;;
   n|nu|nup)
-    declare -r USE_NAMESPACE=true
-    start_vpn
+    start_vpn use_namespace
     ;;
   d|do|dow|down)
     stop_vpn ${3:-} # can be "force"
@@ -917,6 +985,9 @@ case "$CMD" in
   e|ex|exe|exec)
     shift 2
     exec_in_namespace "$@"
+    ;;
+  check)
+    check_dependencies
     ;;
   completion)
     enable_completion
