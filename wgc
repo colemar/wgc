@@ -525,12 +525,27 @@ exec_in_namespace() {
     FINAL_ENV+=("PWD=$PWD")
 
     # Final command
-    exec ip netns exec $NAMESPACE \
-         setpriv --reuid $SUDO_UID --regid $SUDO_GID --init-groups \
-         env -i "${FINAL_ENV[@]}" "$@"
+    local PAYLOAD=(setpriv --reuid $SUDO_UID --regid $SUDO_GID --init-groups env -i "${FINAL_ENV[@]}" "$@")
   else
-    # wgc executed by root
-    exec ip netns exec $NAMESPACE "$@"
+    # wgc direct execution by root: no user/env switch needed
+    local PAYLOAD=("$@")
+  fi
+
+  # Execution with Anti-Leak protection (NSCD)
+  # If we are in a VPN namespace with custom DNS and the host's nscd socket exists,
+  # we must hide it to prevent glibc from using it and ignoring our DNS configuration.
+  if [[ -f /etc/netns/$NAMESPACE/resolv.conf && -S /var/run/nscd/socket ]]; then
+    # Use an ephemeral mount namespace (unshare -m) to hide the socket.
+    # 'mount -t tmpfs' is safer than bind mounting on existing directories.
+    # Pass PAYLOAD as positional arguments to bash to avoid quoting issues.
+    exec ip netns exec $NAMESPACE \
+      unshare -m \
+      /bin/bash -c 'mount -t tmpfs -o size=1M,mode=755 none /var/run/nscd && exec "$@"' \
+      -- "${PAYLOAD[@]}"
+
+  else
+    # No leak risk or nscd not present
+    exec ip netns exec $NAMESPACE "${PAYLOAD[@]}"
   fi
 }
 
