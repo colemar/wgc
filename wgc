@@ -35,6 +35,7 @@ Commands (can be shortened):
   list   - List config files
   exec   - Execute a command in a VPN namespace
            Example: wgc <vpn> exec curl ipinfo.io
+  check  - Check if the required commands are available
 
 To enable bash completion: wgc completion
 Redo completion if WGC_CFGDIR is changed.
@@ -75,6 +76,7 @@ check_dependencies() {
     error "Missing required commands: ${missing[*]}
            Install with: apt install wireguard-tools iproute2 grep sed coreutils procps findutils openresolv util-linux" fatal blameparent
   fi
+  echo "$Y All required commands are available."
 }
 
 has_openresolv() {
