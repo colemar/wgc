@@ -375,12 +375,22 @@ show_config() {
   echo
 }
 
+has_namespace() {
+  [[ -f /run/netns/$NAMESPACE || -f /var/run/netns/$NAMESPACE ]]
+}
+
 is_connected() {
-  declare -g IN_NAMESPACE=
-  ip -br link show $DEV &>/dev/null && return 0
-  IN_NAMESPACE=$NAMESPACE
-  ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null && return 0
-  return 1
+  declare -g IS_CONNECTED= HAS_NAMESPACE= IN_NAMESPACE=
+
+  has_namespace && HAS_NAMESPACE=$NAMESPACE
+  if ip -br link show $DEV &>/dev/null; then
+    IS_CONNECTED=default
+    return 0
+  fi
+  [[ $HAS_NAMESPACE ]] || return 1
+  ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null || return 1
+  IS_CONNECTED=$NAMESPACE; IN_NAMESPACE=$NAMESPACE
+  return 0
 }
 
 show_active_vpns() {
@@ -436,27 +446,6 @@ kill_processes() {
     pids=$(ip netns pids $NAMESPACE 2>/dev/null)
     [[ "$pids" ]] && warn "Processes still running: $pids"
   fi
-}
-
-stop_vpn() {
-  local force=${1:-}
-  is_connected || { warn "$DEV is already disconnected"; return 0; }
-
-  if [[ $IN_NAMESPACE ]]; then
-    local pids=$(get_ns_pids)
-    if [[ $pids ]]; then
-      if [[ $force == force ]]; then
-        kill_processes "$pids"
-      else
-        error "Processes running in namespace $NAMESPACE:
-                $(ps -fp $pids)
-                Force stop (killing processes) with: wgc down $DEV force" fatal
-      fi
-    fi
-  fi
-
-  clean_vpn # reads IN_NAMESPACE
-  echo "$Y VPN $DEV is now disconnected"
 }
 
 is_valid_ident() {
@@ -647,25 +636,72 @@ To avoid sudo password prompt:
 EOF
 }
 
-clean_vpn() {
-  if [[ $IN_NAMESPACE ]]; then
-    # Stop socat bridges
-    if command -v systemctl >/dev/null; then
-			local units_to_stop=$(systemctl list-units --all --type=service,socket --no-legend --plain "wgc.${DEV}.*" | cut -d ' ' -f 1)
-			if [[ $units_to_stop ]]; then
-			  systemctl stop $units_to_stop 2>/dev/null || true
-			  systemctl reset-failed $units_to_stop 2>/dev/null || true
+
+
+stop_vpn() {
+  local force=${1:-}
+
+  if has_namespace; then
+    local pids=$(get_ns_pids)
+    if [[ $pids ]]; then
+      if [[ $force == force ]]; then
+        kill_processes "$pids"
+      else
+        error "Processes running in namespace $NAMESPACE:
+               $(ps -fp $pids)
+               Force stop (killing processes) with: wgc down $DEV force" fatal
       fi
-			rm -f /run/wgc.${DEV}.*.sock 2>/dev/null || true
     fi
-    # Delete interface
-    ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
+  fi
+
+  clean_vpn
+
+  if is_connected; then
+    warn "VPN $DEV is still connected"
+  else
+    echo "$Y VPN $DEV is disconnected"
+  fi
+}
+
+clean_vpn() {
+
+  # Stop bridges
+  if command -v systemctl >/dev/null; then
+
+    local sockets_to_stop=$(systemctl list-units --all --type=socket --no-legend --plain "wgc.${DEV}.*" | cut -d ' ' -f 1)
+    if [[ $sockets_to_stop ]]; then
+      echo "DEBUG: Stopping sockets: $sockets_to_stop" >&2
+      systemctl stop $sockets_to_stop 2>/dev/null || true
+    fi
+
+    local services_to_stop=$(systemctl list-units --all --type=service --no-legend --plain "wgc.${DEV}.*" | cut -d ' ' -f 1)
+    if [[ $services_to_stop ]]; then
+      echo "DEBUG: Stopping services: $services_to_stop" >&2
+      systemctl stop $services_to_stop 2>/dev/null || true
+    fi
+
+    local all_units="$sockets_to_stop $services_to_stop"
+    if [[ $all_units ]]; then
+      systemctl reset-failed $all_units 2>/dev/null || true
+    fi
+
+    rm -f /run/wgc.${DEV}.*.sock 2>/dev/null || true
+
+  fi
+
+  is_connected || true # Set IS_CONNECTED HAS_NAMESPACE IN_NAMESPACE
+
+  [[ $IN_NAMESPACE ]] && ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
+
+  if [[ $HAS_NAMESPACE ]]; then
     # Remove namespace
     # Note: Processes that were in the deleted namespace lose network connectivity
     # but continue running.
     ip netns del $NAMESPACE &>/dev/null || true
     rm -rf /etc/netns/$NAMESPACE &>/dev/null || true
-  else
+  fi
+
+  if [[ $IS_CONNECTED == default ]]; then
     [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
       ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
     # Remove route protecting Wireguard endpoint
@@ -682,6 +718,7 @@ clean_vpn() {
     # Remove interface and related things
     ip link del $DEV &>/dev/null || true
   fi
+
 }
 
 start_transient_service() {
@@ -697,6 +734,7 @@ start_transient_service() {
     --service-type=simple \
     --property=Restart=always \
     --property=RestartSec=3 \
+    --setenv=WGC_BRIDGE=1 \
     "$@" || warn "Command systemd-run failed for unit '$unit_name'."
 }
 
@@ -772,7 +810,7 @@ configure_vpn_in_namespace() {
           # 1. Start Internal Connector
           start_transient_service "$b_unit_int" \
             --description="WGC Connector (proxyd) '$b_name' to port $b_int" \
-            --service-type=notify \
+            --service-type=simple \
             --socket-property=ListenStream="$b_sock" \
             --property=SuccessExitStatus=143 \
             --property=NetworkNamespacePath=/run/netns/$NAMESPACE \
@@ -880,7 +918,7 @@ start_vpn() {
   done
 
   is_connected && \
-    error "$DEV is already connected in namespace ${IN_NAMESPACE:-default}
+    error "$DEV is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
            To reconnect, first stop it: wgc down $DEV" fatal
 
   set_cfgdir
@@ -888,14 +926,9 @@ start_vpn() {
   # get parameters from config file named $DEV
   parse_config_file $DEV
 
-  local IN_NAMESPACE=
-  if $use_namespace; then
-    IN_NAMESPACE=$NAMESPACE
-  else
-    check_openresolv
-  fi
+  $use_namespace || check_openresolv
 
-  push_cleanup clean_vpn # Reads IN_NAMESPACE
+  push_cleanup clean_vpn
 
   # Create WireGuard interface
   ip link add dev $DEV type wireguard || error "Failed to create WireGuard interface '$DEV'" fatal
@@ -931,11 +964,11 @@ start_vpn() {
 
 get_ns_pids() {
   local pid pids=
-  local -a a
-  # filter out forwarding bridges by looking for socket file name pattern
+  local -a e
+  # filter out forwarding bridges by looking for WGC_BRIDGE in process environment
   for pid in $(ip netns pids $NAMESPACE 2>/dev/null); do
-    mapfile -d '' a < /proc/$pid/cmdline 2>/dev/null || continue
-    [[ ${a[*]} == */wgc.$DEV.*.sock* ]] && continue
+    mapfile -d '' e < /proc/$pid/environ 2>/dev/null || continue
+    [[ ${e[*]} == *WGC_BRIDGE=* ]] && continue
     pids+="$pid "
   done
   echo $pids
@@ -943,7 +976,7 @@ get_ns_pids() {
 
 show_status() {
   if is_connected; then
-    echo "$Y $DEV VPN is CONNECTED in namespace ${IN_NAMESPACE:-default}"
+    echo "$Y $DEV VPN is CONNECTED${IN_NAMESPACE:+ in namespace $NAMESPACE}"
     NSCMD=${IN_NAMESPACE:+ip netns exec $NAMESPACE}
     echo
     $NSCMD wg show $DEV
@@ -1116,7 +1149,7 @@ set_markers
 (( $# == 0 )) && { show_usage; exit; }
 [[ $1 == trace ]] && { set -x; shift; }
 ns=$(ip netns identify)
-[[ $(ip netns identify) ]] && error "Usage of wgc is not supported in a network namespace ($ns)" fatal
+[[ $ns ]] && error "Usage of wgc is not supported in a network namespace ($ns)" fatal
 
 CMD=${1:-}
 DEV=${2:-}
