@@ -69,14 +69,14 @@ set_cfgdir() {
 
 check_dependencies() {
   local missing=()
-  for cmd in ip wg grep resolvconf mkdir rm ps sleep find curl sed setpriv socat; do
+  for cmd in tput ip wg grep resolvconf mkdir rm ps sleep find curl sed setpriv socat; do
     command -v $cmd >/dev/null || missing+=($cmd)
   done
-  if [[ ${#missing[@]} -gt 0 ]]; then
+  if (( ${#missing[@]} > 0 )); then
     error "Missing required commands: ${missing[*]}
            Install with:
            apt install wireguard-tools iproute2 grep sed coreutils \\
-           procps findutils openresolv util-linux" fatal blameparent
+           procps findutils openresolv util-linux ncurses-bin" fatal blameparent
   fi
   echo "$Y All required commands are available."
 }
@@ -114,29 +114,32 @@ install_forced_openresolv() {
   mkdir -p "$TEMP_DIR"
   cd "$TEMP_DIR" || return 1
 
-  if apt-get download openresolv 2>/dev/null; then
+  apt-get download openresolv 2>/dev/null
+  local DEB_FILE=$(find . -name "openresolv*.deb" | head -n 1)
+  if [[ $DEB_FILE ]]; then
     echo "Download via APT successful."
   else
-    echo "APT download failed (package likely missing)."
-    local BASE_URL="https://ftp.debian.org/debian/pool/main/o/openresolv/"
-    echo "Attempting direct Debian Pool download from $BASE_URL ..."
-
-    # Find latest .deb file: openresolv_X.X.X-X_all.deb
-    local DEB_NAME=$(curl -s "$BASE_URL" | \
-     grep -oP 'openresolv_[0-9][0-9\.-]+_all\.deb' | \
-     sort -Vu | tail -n 1)
-
-    if [[ -z "$DEB_NAME" ]]; then
-      echo "Error: Could not find openresolv package on Debian FTP."
+    echo "APT download failed (package 'openresolv' likely missing)."
+    echo "Attempting download via Debian Unstable Packages index..."
+    local IDX_URL="https://ftp.debian.org/debian/dists/unstable/main/binary-all/Packages.gz"
+    local REL_PATH=$(curl -s "$IDX_URL" | \
+          zgrep -m 1 "^Filename: .*openresolv_.*_all.deb" | cut -d ' ' -f 2)
+    if [[ -z $REL_PATH ]]; then
+      echo "Error: Could not find openresolv in Debian index."
+      echo "Tried searching: $IDX_URL"
+      echo "This may indicate the package has been removed or renamed."
       cd .. && rm -rf "$TEMP_DIR"
       return 1
     fi
-
-    echo "Detected version: $DEB_NAME"
-    wget -O "$DEB_NAME" "${BASE_URL}${DEB_NAME}" || { echo "Download failed"; return 1; }
+    local FULL_URL="https://ftp.debian.org/debian/$REL_PATH"
+    DEB_FILE=$(basename "$REL_PATH")
+    echo "Detected version: $DEB_FILE"
+    wget -O "$DEB_FILE" "$FULL_URL" || {
+      echo "Download failed: $FULL_URL"
+      cd .. && rm -rf "$TEMP_DIR"
+      return 1
+    }
   fi
-
-  local DEB_FILE=$(find . -name "openresolv*.deb" | head -n 1)
 
   echo "Creating file manifest..."
   mkdir -p /etc/wwggcc
@@ -176,6 +179,7 @@ install_forced_openresolv() {
 
   echo "Openresolv forced successfully."
   echo "Manifest saved to /etc/wwggcc/openresolv.files"
+  echo "To remove openresolv: wgc remopenresolv"
 }
 
 remove_openresolv() {
@@ -373,9 +377,9 @@ show_config() {
 
 is_connected() {
   declare -g IN_NAMESPACE=
-  ip -br link show $DEV 2>/dev/null && return 0
+  ip -br link show $DEV &>/dev/null && return 0
   IN_NAMESPACE=$NAMESPACE
-  ip netns exec $NAMESPACE ip -br link show $DEV 2>/dev/null && return 0
+  ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null && return 0
   return 1
 }
 
@@ -439,14 +443,14 @@ stop_vpn() {
   is_connected || { warn "$DEV is already disconnected"; return 0; }
 
   if [[ $IN_NAMESPACE ]]; then
-    local pids=$(ip netns pids $NAMESPACE 2>/dev/null)
-    if [[ "$pids" ]]; then
-      if [[ "$force" == force ]]; then
+    local pids=$(get_ns_pids)
+    if [[ $pids ]]; then
+      if [[ $force == force ]]; then
         kill_processes "$pids"
       else
         error "Processes running in namespace $NAMESPACE:
-               $(ps -fp $pids)
-               Force stop (killing processes) with: wgc down $DEV force" fatal
+                $(ps -fp $pids)
+                Force stop (killing processes) with: wgc down $DEV force" fatal
       fi
     fi
   fi
@@ -467,16 +471,17 @@ exec_in_namespace() {
   if [[ $(</proc/$PPID/comm) == sudo ]]; then
     # wgc auto-elevated or executed with sudo.
     # sudo inherits and sanitizes the original environment (depending on the active security policy) before executing wgc.
-    local grandpa_pid var_eq_val var
 
     command -v setpriv >/dev/null || error "Missing command 'setpriv'" fatal
-    [[ $SUDO_UID ]] || error "Unable to determine invoking user (SUDO_UID missing)" fatal
+    [[ ${SUDO_UID:-} ]] || error "Unable to determine invoking user (SUDO_UID missing)" fatal
+    [[ ${SUDO_GID:-} ]] || error "Unable to determine invoking group (SUDO_GID missing)" fatal
 
     # Retrieve the Grandparent PID (field 4 of parent's stat).
     # This identifies the correct source for the unsanitized environment:
     # 1. Modern sudo (PTY mode): It targets the main sudo process (which holds the original env).
     # 2. Legacy sudo: It targets the invoking shell directly.
     # In both cases, reading this PID's environ bypasses the sanitization applied by the direct parent.
+    local grandpa_pid var_eq_val var
     read -r _ _ _ grandpa_pid _ < /proc/$PPID/stat # get sudo pid
     # Build the environment for the final command
     local -a FINAL_ENV
@@ -494,6 +499,9 @@ exec_in_namespace() {
     # Final command
     local PAYLOAD=(setpriv --reuid $SUDO_UID --regid $SUDO_GID --init-groups env -i "${FINAL_ENV[@]}" "$@")
   else
+    [[ ${PKEXEC_UID:-} || ${DOAS_USER:-} ]] && \
+      error "Elevation detected but not supported (pkexec/doas).
+             Please use 'sudo wgc ...'" fatal
     # wgc direct execution by root: no user/env switch needed
     local PAYLOAD=("$@")
   fi
@@ -643,9 +651,12 @@ clean_vpn() {
   if [[ $IN_NAMESPACE ]]; then
     # Stop socat bridges
     if command -v systemctl >/dev/null; then
-			local units_to_stop=$(systemctl list-units --type=service --no-legend --plain "wgc-*-${DEV}-" | cut -d ' ' -f 1)
-			[[ $units_to_stop ]] && systemctl stop $units_to_stop 2>/dev/null || true
-			rm -f /run/wgc-${DEV}-*.sock 2>/dev/null || true
+			local units_to_stop=$(systemctl list-units --all --type=service,socket --no-legend --plain "wgc.${DEV}.*" | cut -d ' ' -f 1)
+			if [[ $units_to_stop ]]; then
+			  systemctl stop $units_to_stop 2>/dev/null || true
+			  systemctl reset-failed $units_to_stop 2>/dev/null || true
+      fi
+			rm -f /run/wgc.${DEV}.*.sock 2>/dev/null || true
     fi
     # Delete interface
     ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
@@ -681,12 +692,12 @@ start_transient_service() {
 
   # Start the service
   # "$@" contains both the extra properties and the final command
-  systemd-run --unit="$unit_name" \
-      --description="WGC Service $unit_name" \
-      --service-type=simple \
-      --property=Restart=always \
-      --property=RestartSec=3 \
-      "$@"
+  systemd-run --quiet --unit="$unit_name" \
+    --description="WGC Service $unit_name" \
+    --service-type=simple \
+    --property=Restart=always \
+    --property=RestartSec=3 \
+    "$@" || warn "Command systemd-run failed for unit '$unit_name'."
 }
 
 configure_vpn_in_namespace() {
@@ -723,10 +734,21 @@ configure_vpn_in_namespace() {
 
   # Start socat bridges
   if (( ${#WGC_BRIDGES[@]} > 0 )); then
-    if ! command -v socat >/dev/null; then
+    local bridge_data b_name b_ext b_int b_sock b_unit_int b_unit_ext
+
+    local PROXYD_BIN
+    for PROXYD_BIN in /lib/systemd/systemd-socket-proxyd /usr/lib/systemd/systemd-socket-proxyd ""; do
+      [[ -x $PROXYD_BIN ]] && break
+    done
+    if [[ ! $PROXYD_BIN ]]; then
+      warn "systemd-socket-proxyd not found, falling back to socat"
+    fi
+
+    if [[ ! $PROXYD_BIN ]] && ! command -v socat >/dev/null; then
+
       warn "socat not found: cannot start defined bridges in [WGC-Bridges]"
+
     else
-      local bridge_data b_name b_ext b_int b_sock b_unit_int b_unit_ext
 
       echo "Starting Port Forwarding Bridges:"
       printf "%-20s %s\n" "Bridge" "ExtPort -> IntPort"
@@ -734,9 +756,9 @@ configure_vpn_in_namespace() {
 
       for bridge_data in "${WGC_BRIDGES[@]}"; do
         IFS=: read -r b_name b_ext b_int <<< $bridge_data
-        b_sock=/run/wgc-$DEV-$b_name.sock
-        b_unit_int=wgc-connect-$DEV-$b_name
-        b_unit_ext=wgc-expose-$DEV-$b_name
+        b_sock=/run/wgc.$DEV.$b_name.sock
+        b_unit_int=wgc.$DEV.$b_name.int
+        b_unit_ext=wgc.$DEV.$b_name.ext
 
         # Is external port available for listen?
         if [[ $(ss -lntH "sport = :$b_ext") ]] ; then
@@ -746,26 +768,60 @@ configure_vpn_in_namespace() {
 
         printf "%-20s %s\n" "$b_name" "$b_ext -> $b_int"
 
-        # 1. Start Internal Connector
-        start_transient_service "$b_unit_int" \
-          --description="WGC Internal Connector '$b_name' for $DEV to port $b_int" \
-          ip netns exec $NAMESPACE \
-          socat UNIX-LISTEN:"$b_sock",fork,reuseaddr,unlink-early,mode=600,max-children=50 TCP:127.0.0.1:$b_int,tcp-nodelay
-
-        # 2. Start External Listener
-        start_transient_service "$b_unit_ext" \
-          --description="WGC External Listener '$b_name' for $DEV at port $b_ext" \
-          --property=After=$b_unit_int.service \
-          --property=BindsTo=$b_unit_int.service \
-          socat TCP-LISTEN:$b_ext,fork,reuseaddr,tcp-nodelay UNIX-CONNECT:"$b_sock"
+        if [[ $PROXYD_BIN ]]; then # use systemd-socket-proxyd
+          # 1. Start Internal Connector
+          start_transient_service "$b_unit_int" \
+            --description="WGC Connector (proxyd) '$b_name' to port $b_int" \
+            --service-type=notify \
+            --socket-property=ListenStream="$b_sock" \
+            --property=SuccessExitStatus=143 \
+            --property=NetworkNamespacePath=/run/netns/$NAMESPACE \
+            /usr/bin/env "WGC_MARKER=$b_sock" $PROXYD_BIN 127.0.0.1:$b_int
+          # 2. Start External Listener
+          start_transient_service "$b_unit_ext" \
+            --description="WGC Listener (proxyd) '$b_name' at port $b_ext" \
+            --property=After=$b_unit_int.service \
+            --property=BindsTo=$b_unit_int.service \
+            --service-type=notify \
+            --socket-property=ListenStream=$b_ext \
+            --property=SuccessExitStatus=143 \
+            $PROXYD_BIN "$b_sock"
+        else # use socat
+          # 1. Start Internal Connector
+          start_transient_service "$b_unit_int" \
+            --description="WGC Connector (socat) '$b_name' to port $b_int" \
+            --property=SuccessExitStatus=143 \
+            ip netns exec $NAMESPACE \
+            socat UNIX-LISTEN:"$b_sock",fork,reuseaddr,unlink-early,mode=600,max-children=50 TCP:127.0.0.1:$b_int,tcp-nodelay
+          # 2. Start External Listener
+          start_transient_service "$b_unit_ext" \
+            --description="WGC Listener (socat) '$b_name' at port $b_ext" \
+            --property=After=$b_unit_int.service \
+            --property=BindsTo=$b_unit_int.service \
+            --property=SuccessExitStatus=143 \
+            socat TCP-LISTEN:$b_ext,fork,reuseaddr,tcp-nodelay UNIX-CONNECT:"$b_sock"
+        fi
 
         # 3. Health check
-        sleep 0.5
-        if ! systemctl is-active --quiet "$b_unit_ext"; then
-          warn "Bridge '$b_name' failed to start (check logs: journalctl -u $b_unit_ext)"
-          systemctl stop "$b_unit_ext" "$b_unit_int" 2>/dev/null || true
+        local unit_to_check="$b_unit_ext"
+        local units_to_clean="$b_unit_ext $b_unit_int"
+        if [[ $PROXYD_BIN ]]; then
+          unit_to_check="${b_unit_ext}.socket"
+          units_to_clean+=" ${b_unit_ext}.socket"
         fi
+        local retries=20 # 2 seconds total
+        while ((retries-- > 0)); do
+          sleep 0.1
+          systemctl is-active --quiet "$unit_to_check" && break
+        done
+        if ! systemctl is-active --quiet "$unit_to_check"; then
+          warn "Bridge '$b_name' failed to start (check logs: journalctl -u $unit_to_check)"
+          systemctl stop $units_to_clean 2>/dev/null || true
+          systemctl reset-failed $units_to_clean 2>/dev/null || true
+        fi
+
       done
+      echo
     fi
   fi
 }
@@ -873,6 +929,18 @@ start_vpn() {
 
 }
 
+get_ns_pids() {
+  local pid pids=
+  local -a a
+  # filter out forwarding bridges by looking for socket file name pattern
+  for pid in $(ip netns pids $NAMESPACE 2>/dev/null); do
+    mapfile -d '' a < /proc/$pid/cmdline 2>/dev/null || continue
+    [[ ${a[*]} == */wgc.$DEV.*.sock* ]] && continue
+    pids+="$pid "
+  done
+  echo $pids
+}
+
 show_status() {
   if is_connected; then
     echo "$Y $DEV VPN is CONNECTED in namespace ${IN_NAMESPACE:-default}"
@@ -890,9 +958,15 @@ show_status() {
       echo "DNS:"
       grep -E --color '([0-9]{1,3}\.){3}[0-9]{1,3}' \
         /etc/netns/$NAMESPACE/resolv.conf 2>/dev/null || echo "  (none)"
+      if [[ ${1:-} == show_bridges ]]; then
+        echo
+        echo "Forwarding Bridges:"
+        SYSTEMD_COLORS=1 systemctl list-units --type=service,socket "wgc.${DEV}.*" | \
+          awk '/(^[[:space:]]*$|UNIT[^ ]* LOAD)/ {exit} {print; n++} END {if (n<=1) print "  (none)"}'
+      fi
       echo
       echo "Processes running in namespace $NAMESPACE:"
-      local pids=$(ip netns pids $NAMESPACE 2>/dev/null)
+      local pids=$(get_ns_pids)
       [[ $pids ]] && ps -fp $pids || echo "  (none)"
       echo
       echo "To run commands in the VPN namespace:"
@@ -1038,14 +1112,18 @@ indent_multiline() {
 }
 
 # -----------------------------------------------------------------------------
+set_markers
+(( $# == 0 )) && { show_usage; exit; }
 [[ $1 == trace ]] && { set -x; shift; }
+ns=$(ip netns identify)
+[[ $(ip netns identify) ]] && error "Usage of wgc is not supported in a network namespace ($ns)" fatal
 
 CMD=${1:-}
 DEV=${2:-}
 
 [[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" "$0" "$@"
 
-set -e
+set -e          # Exit immediately if a command exits with a non-zero status.
 set -u          # Treat unset variables as an error.
 set -o pipefail # Return value of a pipeline is the status of the last command to exit with a non-zero status.
 set -o errtrace # Trap ERR is inherited by functions.
@@ -1055,7 +1133,6 @@ unset IFS
 NAMESPACE=$DEV
 declare -r CMD DEV NAMESPACE
 
-set_markers
 trap 'error TRAP fatal' ERR
 
 [[ $CMD == @(up|upd|n|nu|nup|d|do|dow|down|s|st|sta|stat|statu|status|e|ex|exe|exec) ]] && validate_vpn_name
@@ -1074,7 +1151,7 @@ case "$CMD" in
     stop_vpn ${3:-} # can be "force"
     ;;
   s|st|sta|stat|statu|status)
-    show_status
+    show_status show_bridges
     ;;
   a|ac|act|acti|activ|active)
     show_active_vpns
