@@ -22,8 +22,7 @@ show_usage() {
 Usage: wgc [options] [ [up|upd|nup|down|status] <vpn> | active | list | exec <vpn> <command> ]
 
 <vpn> should match a config file name \$WGC_CFGDIR/<vpn>.conf
-Set and export WGC_CFGDIR to point to dir containing Wireguard *.conf files.
-Default config dir is /etc/wireguard.
+Export WGC_CFGDIR to point to dir containing Wireguard *.conf files (default: /etc/wireguard).
 
 Commands (can be shortened):
   up     - Start a VPN
@@ -33,88 +32,53 @@ Commands (can be shortened):
   status - Show VPN status
   active - Show active VPNs
   list   - List config files
+  conf   - Show config file <vpn>.conf
   exec   - Execute a command in a VPN namespace
            Example: wgc <vpn> exec curl ipinfo.io
-  check  - Check if the required commands are available
+  check  - Check dependencies (required commands)
 
 To enable bash completion: wgc completion
 Redo completion if WGC_CFGDIR is changed.
 EOF
 }
 
-# This function might seem like an over-engineered approach to the problem of accepting named arguments,
-# but it ultimately proves to be a flexible, secure, simple-to-use, and reasonably efficient solution.
+# Minimalist argument parser helper.
+# Maps arguments of the form 'name=value' to readonly local variables prefixed with 'p_'.
 #
-# Usage Protocol for the get_args helper function:
+# Usage Protocol:
+# 1. Consume and shift out all initial fixed positional arguments.
+# 2. Define default values for optional parameters as local variables with 'p_' prefix.
+# 3. Execute: eval "$(get_params "$@")" to parse and overwrite defaults.
 #
-# A generic function func() (or main program) must adhere to the following contract:
-# 1. Define Parameter Specifications: The function must declare an associative array named 'params'.
-#    This array serves two purposes: it acts as a whitelist of accepted parameter names and defines their default values.
-#    If a parameter has '?' as default value it is deemed as required. Default value '?' is forbidden for optional parameters.
-# 2. Invoke the Parser: The function must execute the helper within an eval statement using command substitution:
-#    eval "$(get_args "$@")". Double quotes around the substitution are mandatory to prevent accidental side effects.
-# 3. Variable Instantiation: Upon execution of the eval line, readonly local variables corresponding to the keys in params
-#    will be automatically initialized within the function's scope.
-#    These variables will contain either the value passed by the caller or the default value defined in the array.
-# 4. The array params will be unaffected, since command substitution creates a copy for get_args().
-#    The array cannot be initially declared as readonly (-r), because the copy will be also readonly and get_args()
-#    needs to manipulate it.
+# Argument Syntax:
+# - name=value  -> Sets p_name to "value".
+# - name        -> Sets p_name to "name" (Flag mode, equivalent to name=name).
 #
-# Arguments of func() can be specified as:
-#   - name=value  (Standard form: sets variable 'name' to 'value')
-#   - name        (Flag form: equivalent to name=name, useful for boolean checks like [[ $name ]])
+# Constraints & Responsibilities:
+# 1. Caller: Must ensure passed argument keys are valid Bash identifiers (alphanumeric/underscore)
+#    to avoid syntax errors during assignment.
+# 2. Function Implementation: Must NOT use local variables starting with 'p_' for internal logic,
+#    as this namespace is reserved for the generated parameters.
 #
-# Error Handling:
-# - If unexpected keyword arguments are passed, get_args prints an error for each one,
-#   completes parsing, then returns 1. The caller should handle this error (e.g., with || return 1).
-# - If a required keyword argument is missing, get_args prints an error message and terminates the script with exit 1.
-#   This is a fatal programming error - the script cannot continue without required parameters.
+# Example:
+#   func() {
+#     shift 1                        # Remove fixed arguments if any
+#     local p_timeout=10 p_verbose=  # Define defaults (mutable)
+#     eval "$(get_params "$@")"      # Parse arguments, override defaults and lock variables (readonly)
+#     echo "Timeout: $p_timeout"
+#     [[ $p_verbose ]] && echo "Verbose active"
+#   }
+#   func arg1 timeout=30 verbose
 #
-# Canonical Example:
-#
-# func() {
-#   local -A params=([tmout]=10 [file]=? [retr]= [verbose]=)
-#   eval "$(get_args "$@")" || return 1 # Handle unexpected arguments
-#   echo "Processing '$file' with timeout ${tmout}s (Attempt 1/$retr)..."
-#   [[ $verbose ]] && date
-# }
-#
-# func file=input.txt             # Processing 'input.txt' with timeout 10s (Attempt 1/)...
-# func file=input.txt verbose     # Same as above + Wed Dec 3 01:41:28 AM CET 2025
-# func retr=2 file=a.txt          # Processing 'a.txt' with timeout 10s (Attempt 1/2)...
-# func 'file=w s.txt'             # Processing 'w s.txt' with timeout 10s (Attempt 1/)...
-# func file='w s.txt'             # Same as above.
-# func fi'le=w s.txt'             # Same as above.
-# func file=a.txt retr=5 tmout=19 # Processing 'a.txt' with timeout 19s (Attempt 1/5)...
-# func file=a.txt retr=2 foo=1    # ERROR: func() got an unexpected keyword argument 'foo' # eval exit code is 1
-# func retr=2 tmout=1             # FATAL ERROR: func() missing required keyword argument 'file' # script terminates
-#
-get_args() {
-  local arg key buf err= caller="${FUNCNAME[1]}()"
+get_params() {
+  local arg key buf=
   local -i n=1
-
   for arg; do
     key=${arg%%=*}
-    if [[ -v params[$key] ]]; then
-      buf+=" $key=\${$n#*=}"
-      unset params[$key]
-    else
-      echo "ERROR: $caller got an unexpected keyword argument '$key'" >&2
-      err=1
-    fi
+    buf+=" p_$key=\${$n#*=}"
     ((n++))
   done
-
-  for key in "${!params[@]}"; do
-    if [[ ${params[$key]} != \? ]]; then
-      buf+=" $key=\${params[$key]}"
-    else
-      echo "FATAL ERROR: $caller missing required keyword argument '$key'" >&2
-      echo "exit 1"; return 1
-    fi
-  done
-
-  echo "${buf:+local -r}$buf${err:+$'\n'false}"
+  echo "${buf:+local -r}$buf"
 }
 
 set_markers() {
@@ -305,15 +269,44 @@ list_config_files() {
   local f= g=
   set_cfgdir
   echo -e "Looking in $CFGDIR\n"
-  printf "%-12s %-18s %-29s %s\n" "Name" "Address" "Endpoint" "AllowedIPs"
-  printf "%-12s %-18s %-29s %s\n" "----" "-------" "--------" "----------"
-  for f in $CFGDIR/*.conf; do
-    [[ "$f" == "$CFGDIR/*.conf" ]] && return 0
+  printf "%-12s %-4s %-18s %-29s %s\n" Name Br. Address Endpoint AllowedIPs
+  printf "%-12s %-4s %-18s %-29s %s\n" ---- --- ------- -------- ----------
+  for f in "$CFGDIR"/*.conf; do
     g=${f##*/}; g=${g%.*}
     [[ $g =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-    parse_config_file "$g" relax || continue
+    parse_config_file "$g" bridges relax || continue
     (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
-    printf "%-12s %-18s %-29s %s\n" "$g" "$Address" "$Endpoint" "$AllowedIPs"
+    printf "%-12s %-4s %-18s %-29s %s\n" "$g" ${#WGC_BRIDGES[@]} "$Address" "$Endpoint" "$AllowedIPs"
+  done
+}
+
+show_config_file() {
+  set_cfgdir
+  local config_file="$CFGDIR/$DEV.conf"
+  [[ -f $config_file ]] || error "Not a file: $config_file"
+  [[ -r $config_file ]] || error "Cannot read file: $config_file"
+  printf %s\\n "$(< $config_file)"
+}
+
+show_parsed_config_file() {
+  set_cfgdir
+  parse_config_file $DEV bridges
+  show_config
+}
+
+show_config() {
+  echo
+  for k in Address PrivateKey PublicKey PresharedKey ListenPort DNS MTU Endpoint AllowedIPs PersistentKeepalive; do
+    echo "$k=${!k}"
+    [[ $k == PrivateKey ]] && echo "    PUBLIC $(wg pubkey <<<${!k})"
+  done
+  echo
+  local bridge_data b_name b_ext b_int
+  printf "%-20s %s\n" "Forwarding Bridge" "ExtPort -> IntPort"
+  printf "%-20s %s\n"  -----------------   ------------------
+  for bridge_data in "${WGC_BRIDGES[@]}"; do
+    IFS=: read -r b_name b_ext b_int <<< $bridge_data
+    printf "%-20s %s\n" "$b_name" "$b_ext -> $b_int"
   done
 }
 
@@ -323,21 +316,15 @@ is_valid_port() {
 }
 
 parse_config_file() {
-  local CONFIG_FILE="$CFGDIR/$1.conf" opts=${2:-}
+  local config_file="$CFGDIR/$1.conf"
+  shift 1
+  local p_relax= p_bridges=
+  eval "$(get_params "$@")"
 
-  local fatal=fatal parse_bridges=
+  local fatal=fatal; [[ $p_relax ]] && fatal=
 
-  local opt
-  for opt in $opts; do
-    case "$opt" in
-      relax) fatal= ;;
-      bridges) parse_bridges=1 ;;
-      *) warn "Unknown option passed to parse_config_file: '$opt'" ;;
-    esac
-  done
-
-  [[ -f "$CONFIG_FILE" ]] || { error "Config file not found: $CONFIG_FILE" $fatal blameparent; return 1; }
-  [[ -r "$CONFIG_FILE" ]] || { error "Can't read file: $CONFIG_FILE" $fatal blameparent; return 1; }
+  [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
+  [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
   local line= n=0 s= section= key= value= WARNINGS= BADSECTION=
   declare -g Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= \
     DNS= MTU= ListenPort= PersistentKeepalive= PresharedKey=
@@ -364,11 +351,11 @@ parse_config_file() {
       fi
       # Get values according to section/key
       process_config_line $s $n "$key" "$value" "$section"
-  done < "$CONFIG_FILE"
-  if [[ ! $relax ]]; then
-    [[ "$WARNINGS" ]] && warn "Skipping invalid entries in $CONFIG_FILE:$WARNINGS"
+  done < "$config_file"
+  if [[ ! $p_relax ]]; then
+    [[ "$WARNINGS" ]] && warn "Skipping invalid entries in $config_file:$WARNINGS"
     for n in Address PrivateKey PublicKey Endpoint AllowedIPs; do
-      [[ ${!n} ]] || error "Missing required key '$n' in file $CONFIG_FILE" fatal blameparent
+      [[ ${!n} ]] || error "Missing required key '$n' in file $config_file" fatal blameparent
     done
   fi
 }
@@ -398,7 +385,7 @@ process_config_line() {
       esac
       ;;
     "[WGC-Bridges]")
-      [[ $parse_bridges ]] || return 0
+      [[ $p_bridges ]] || return 0
       # Sintax: <bridgename> = <externalport>-<internalport>
       # Example: qBittorrent = 8765-8765
       if [[ ! $key =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -453,13 +440,6 @@ extract_all_ipv4() {
     _in=${_in#*"${BASH_REMATCH[0]}"}
   done
   _out=${_out#$_sep} # Remove initial separator if present
-}
-
-show_config() {
-  for k in Address PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
-    echo "$k=${!k}"
-  done
-  echo
 }
 
 has_namespace() {
@@ -623,6 +603,8 @@ get_nscd_fix_cmd() {
 
   [[ $found ]] || return 1
 
+  cmd="mount --make-rprivate / 2>/dev/null && $cmd"
+
   local nss_content=
   if [[ -r /etc/nsswitch.conf ]]; then
     nss_content=$(sed -E 's/[[:space:]]*\b(nscd|sss)\b//g' /etc/nsswitch.conf)
@@ -672,7 +654,7 @@ _wgc_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
   # Main commands
-  commands="up upd nup down status active list exec"
+  commands="conf parse up upd nup down status active list exec"
 
   # Complete the first arg with main commands
   if [[ $COMP_CWORD -eq 1 ]]; then
@@ -684,7 +666,7 @@ _wgc_completion() {
   if [[ $COMP_CWORD -eq 2 ]]; then
     local vpns= ns= x= dev=
     case "$prev" in
-      up|upd|n|nu|nup)
+      up|upd|n|nu|nup|c|co|con|conf|p|pa|par|pars|parse)
         # VPN config file list
         local f=
         for f in $(sudo find ${WGC_CFGDIR:-/etc/wireguard} -maxdepth 1 -name "*.conf" -type f 2>/dev/null); do
@@ -744,6 +726,7 @@ EOF
 
   chmod 644 "$completion_file"
 
+set_cfgdir
   cat << EOF
 $Y Bash completion installed to $completion_file
 
@@ -861,7 +844,6 @@ start_transient_service() {
     --property=StartLimitIntervalSec=10 \
     --setenv=WGC_BRIDGE=1 \
     --property=SuccessExitStatus=143 \
-    --collect \
     "$@" || warn "Command systemd-run failed for unit '$unit_name'."
 }
 
@@ -946,7 +928,7 @@ configure_vpn_in_namespace() {
             $PROXYD_BIN 127.0.0.1:$b_int
           # 2. Start External Listener
           start_transient_service "$b_unit_ext" \
-            --description="WGC Listener (proxyd) '$b_name' at port $b_ext" \
+            --description="WGC Listener (proxyd) '$b_name' $b_ext -> $b_int" \
             --socket-property=ListenStream=$b_ext \
             --property=After=$b_unit_int.service \
             --property=BindsTo=$b_unit_int.service \
@@ -959,28 +941,23 @@ configure_vpn_in_namespace() {
             socat UNIX-LISTEN:"$b_sock",fork,reuseaddr,unlink-early,mode=600,max-children=50 TCP:127.0.0.1:$b_int,tcp-nodelay
           # 2. Start External Listener
           start_transient_service "$b_unit_ext" \
-            --description="WGC Listener (socat) '$b_name' at port $b_ext" \
+            --description="WGC Listener (socat) '$b_name' $b_ext -> $b_int" \
             --property=After=$b_unit_int.service \
             --property=BindsTo=$b_unit_int.service \
             socat TCP-LISTEN:$b_ext,fork,reuseaddr,tcp-nodelay UNIX-CONNECT:"$b_sock"
         fi
 
         # 3. Health check
-        local unit_to_check="$b_unit_ext"
-        local units_to_clean="$b_unit_ext $b_unit_int"
-        if [[ $PROXYD_BIN ]]; then
-          unit_to_check="${b_unit_ext}.socket"
-          units_to_clean+=" ${b_unit_ext}.socket"
-        fi
+        local unit_to_check="$b_unit_ext.service"
+        [[ $PROXYD_BIN ]] && unit_to_check="${b_unit_ext}.socket"
         local retries=20 # 2 seconds total
         while ((retries-- > 0)); do
           sleep 0.1
           systemctl is-active --quiet "$unit_to_check" && break
         done
-        if ! systemctl is-active --quiet "$unit_to_check"; then
-          warn "Bridge '$b_name' failed to start (check logs: journalctl -u $unit_to_check)"
-          systemctl stop $units_to_clean 2>/dev/null || true
-          systemctl reset-failed $units_to_clean 2>/dev/null || true
+        if ((retries < 0)); then
+          local status=$(systemctl is-active "$unit_to_check" 2>/dev/null)
+          warn "Bridge '$b_name' failed to start (status: ${status:-unknown}). Check logs: journalctl -u $unit_to_check"
         fi
 
       done
@@ -999,13 +976,13 @@ configure_vpn_plain() {
   ip link set $DEV up || error "Failed to bring up interface '$DEV' with address '$Address'" fatal
 
   # Add a "split tunnel route" if wanted
-  [[ $split_tunnel_route ]] && q=($(ip route get ${Endpoint%%:*} 2>/dev/null)) && {
+  if [[ $p_split_tunnel_route ]]; then
+    q=($(ip route get ${Endpoint%%:*} 2>/dev/null)) && [[ $q ]] || error "Cannot find route to endpoint ${Endpoint%%:*}" fatal
     # Add specific route to protect WireGuard UDP Stateless Tunnel to Endpoint
-    [[ $q ]] || error "Cannot find route to endpoint ${Endpoint%%:*}" fatal
     ip route replace ${q[@]:0:3} || error "Cannot set route to endpoint ${Endpoint%%:*}" fatal
     ip route add 0/1 dev $DEV
     ip route add 128/1 dev $DEV
-  }
+  fi
 
   # Add default route valid only for source $Address (policy routing)
   local k=
@@ -1032,16 +1009,8 @@ configure_vpn_plain() {
 }
 
 start_vpn() {
-  local opts=${2:-}
-
-  local opt split_tunnel_route= use_namespace=
-
-  for opt in $opts; do
-    case $opt in
-      split_tunnel_route) split_tunnel_route=1 ;;
-      use_namespace) use_namespace=1 ;;
-    esac
-  done
+  local p_split_tunnel_route= p_use_namespace=
+  eval "$(get_params "$@")"
 
   is_connected && \
     error "$DEV is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
@@ -1049,10 +1018,10 @@ start_vpn() {
 
   set_cfgdir
 
-  # get parameters from config file named $DEV
-  parse_config_file $DEV
+  [[ $p_use_namespace ]] || check_openresolv
 
-  [[ $use_namespace ]] || check_openresolv
+  # get parameters and forwarding bridges from config file named $DEV
+  parse_config_file $DEV ${p_use_namespace:+bridges}
 
   push_cleanup clean_vpn
 
@@ -1076,7 +1045,7 @@ start_vpn() {
     error " " fatal
   }
 
-  if $use_namespace; then
+  if [[ $p_use_namespace ]]; then
     configure_vpn_in_namespace
   else
     configure_vpn_plain
@@ -1100,7 +1069,67 @@ get_ns_pids() {
   echo $pids
 }
 
+show_bridges() {
+  # Format: UNIT LOAD ACTIVE SUB DESCRIPTION
+  local output=$(systemctl list-units --all --full --type=service,socket --no-legend --plain "wgc.${DEV}.*")
+
+  if [[ $output ]]; then
+    echo
+    printf "  %-18s %-19s %-8s %s\n" Bridge "ExtPort -> IntPort" Type Status
+    printf "  %-18s %-19s %-8s %s\n" ------ "------------------" ---- ------
+
+    # Load all info in hash maps for instant lookup
+    local -A u_active u_desc
+    local u load active sub desc
+    while read -r u load active sub desc; do
+      u_active[$u]=$active
+      u_desc[$u]=$desc
+    done <<< "$output"
+
+    # Iterate an print
+    for u in "${!u_active[@]}"; do
+      # Only one line per each external Listener
+      [[ $u != *.ext.* ]] && continue
+
+      desc="${u_desc[$u]}"; active="${u_active[$u]}"
+
+      # Parse unit description.
+      # Example: WGC Listener (proxyd) 'Privoxy' 8081 -> 8080
+      #                        tool     name     p_ext   p_int
+      local regex="\(([^)]+)\) '([^']+)' ([0-9]+) -> ([0-9]+)"
+      if [[ $desc =~ $regex ]]; then
+        tool=${BASH_REMATCH[1]}
+        name=${BASH_REMATCH[2]}
+        p_ext=${BASH_REMATCH[3]}
+        p_int=${BASH_REMATCH[4]}
+        # We are interested only in sockets (proxyd) or socat services
+        if [[ $u == *.socket ]] || [[ $tool == "socat" ]]; then
+          local status_str=$active
+          case "$active" in
+            active)               status_str="$Y $status_str" ;;
+            failed)               status_str="$X $status_str" ;;
+            activating|reloading) status_str=$'\u25cf'" $status_str" ;;
+            *)                    status_str="- $status_str" ;;
+          esac
+
+          local int_unit="wgc.${DEV}.${name}.int.socket" # proxyd
+          [[ $tool == socat ]] && int_unit="wgc.${DEV}.${name}.int.service"
+          local int_state="${u_active[$int_unit]:-missing}"
+          [[ $int_state != active ]] && status_str+=" / Int: $X $int_state"
+
+          printf "  %-18s %-7s %-11s %-8s %s\n" "$name" "$p_ext" "-> $p_int" "$tool" "$status_str"
+        fi
+      fi
+    done | sort # hash map order is undefined
+  else
+    echo "  (none)"
+  fi
+}
+
 show_status() {
+  local p_bridges=
+  eval "$(get_params "$@")"
+
   if is_connected; then
     echo "$Y $DEV VPN is CONNECTED${IN_NAMESPACE:+ in namespace $NAMESPACE}"
     NSCMD=${IN_NAMESPACE:+ip netns exec $NAMESPACE}
@@ -1117,11 +1146,10 @@ show_status() {
       echo "DNS:"
       grep -E --color '([0-9]{1,3}\.){3}[0-9]{1,3}' \
         /etc/netns/$NAMESPACE/resolv.conf 2>/dev/null || echo "  (none)"
-      if [[ ${1:-} == show_bridges ]]; then
+      if [[ $p_bridges ]]; then
         echo
         echo "Forwarding Bridges:"
-        SYSTEMD_COLORS=1 systemctl list-units --type=service,socket "wgc.${DEV}.*" | \
-          awk '/(^[[:space:]]*$|UNIT[^ ]* LOAD)/ {exit} {print; n++} END {if (n<=1) print "  (none)"}'
+        show_bridges
       fi
       echo
       echo "Processes running in namespace $NAMESPACE:"
@@ -1287,6 +1315,7 @@ set -u          # Treat unset variables as an error.
 set -o pipefail # Return value of a pipeline is the status of the last command to exit with a non-zero status.
 set -o errtrace # Trap ERR is inherited by functions.
 shopt -s extglob # Enable extended glob patterns: x(y)
+shopt -s nullglob
 unset IFS
 
 NAMESPACE=$DEV
@@ -1297,6 +1326,12 @@ trap 'error TRAP fatal' ERR
 [[ $CMD == @(up|upd|n|nu|nup|d|do|dow|down|s|st|sta|stat|statu|status|e|ex|exe|exec) ]] && validate_vpn_name
 
 case "$CMD" in
+  c|co|con|conf)
+    show_config_file
+    ;;
+  p|pa|par|pars|parse)
+    show_parsed_config_file
+    ;;
   up)
     start_vpn
     ;;
@@ -1310,17 +1345,17 @@ case "$CMD" in
     stop_vpn ${3:-} # can be "force"
     ;;
   s|st|sta|stat|statu|status)
-    show_status show_bridges
+    show_status bridges
+    ;;
+  e|ex|exe|exec)
+    shift 2
+    exec_in_namespace "$@"
     ;;
   a|ac|act|acti|activ|active)
     show_active_vpns
     ;;
   l|li|lis|list)
     list_config_files
-    ;;
-  e|ex|exe|exec)
-    shift 2
-    exec_in_namespace "$@"
     ;;
   check)
     check_dependencies
