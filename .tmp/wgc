@@ -31,9 +31,10 @@ doit() {
   export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
   # Sanitized auto-elevation
-  [[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= SHELLOPTS= "$0" "$@"
-  [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-}${IFS:-}${SHELLOPTS:-} ]] && \
-    exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH -u IFS -u SHELLOPTS "$0" "$@"
+  [[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
+  # unset fails when readonly
+  [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
+    exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
 
   set +vx
   [[ ${1:-} == trace ]] && { set -vx; shift; }
@@ -58,11 +59,13 @@ doit() {
 
   (( $# == 0 )) && { show_usage; exit; }
 
-  local -r CMD=${1:-} DEV=${2:-} NAMESPACE=$DEV
+  local -r CMD=${1:-} VPN=${2:-}
+  local DEV=wgc_${VPN:-}
+  local NAMESPACE=${VPN:-}
 
   local W X Y; set_markers; readonly W X Y
   local CFGDIR; set_cfgdir; readonly CFGDIR
-  local IS_CONNECTED HAS_NAMESPACE IN_NAMESPACE
+  local IS_CONNECTED HAS_NAMESPACE IN_NAMESPACE IS_WGC
   local Address PrivateKey PublicKey Endpoint AllowedIPs DNS MTU ListenPort PersistentKeepalive PresharedKey
   local -a WGC_BRIDGES
 
@@ -210,9 +213,11 @@ set_cfgdir() {
   [[ ! -d "$CFGDIR" ]] && \
     error "Configuration directory not found: $CFGDIR
           Set WGC_CFGDIR to point to dir containing Wireguard *.conf files." fatal
-  [[ ! -r "$CFGDIR" ]] && \
-    error "Configuration directory found, but not readable: $CFGDIR
-          Check permissions (e.g., 'sudo chmod o+rX $CFGDIR')." fatal
+  if ! ls "$CFGDIR" &>/dev/null; then
+    error "Cannot access configuration directory: $CFGDIR
+           Possible causes: SELinux, AppArmor, or mount restrictions.
+           Debug: sudo ls -ldZ '$CFGDIR' && sudo getenforce" fatal
+  fi
   return 0
 }
 
@@ -390,14 +395,14 @@ list_config_files() {
 }
 
 show_config_file() {
-  local -r config_file="$CFGDIR/$DEV.conf"
+  local -r config_file="$CFGDIR/$VPN.conf"
   [[ -f $config_file ]] || error "Not a file: $config_file"
   [[ -r $config_file ]] || error "Cannot read file: $config_file"
   printf %s\\n "$(< $config_file)"
 }
 
 show_parsed_config_file() {
-  parse_config_file $DEV bridges
+  parse_config_file $VPN bridges
   show_config
 }
 
@@ -632,8 +637,8 @@ is_valid_ident() {
 
 exec_in_namespace() {
   [[ $# -eq 0 ]] && { error "No command specified"; show_usage; exit 1; }
-  is_connected || error "VPN $DEV is not connected. Start it first with: wgc nup $DEV" fatal
-  [[ $IN_NAMESPACE ]] || error "VPN $DEV is not in its own namespace. Just use plain command: $@" fatal
+  is_connected || error "VPN $VPN is not connected. Start it first with: wgc nup $VPN" fatal
+  [[ $IN_NAMESPACE ]] || error "VPN $VPN is not in its own namespace. Just use plain command: $@" fatal
 
   if [[ $(</proc/$PPID/comm) == sudo ]]; then
     # wgc auto-elevated or executed with sudo.
@@ -773,36 +778,43 @@ _wgc_completion() {
 
   # Complete the second arg depending on command
   if [[ $COMP_CWORD -eq 2 ]]; then
-    local vpns= ns= x= dev=
     case "$prev" in
       up|upd|n|nu|nup|c|co|con|conf|p|pa|par|pars|parse)
         # VPN config file list
-        local f=
-        for f in $(sudo find ${WGC_CFGDIR:-/etc/wireguard} -maxdepth 1 -name "*.conf" -type f 2>/dev/null); do
+        local -a c=( /usr/bin/find "${WGC_CFGDIR:-/etc/wireguard}" -maxdepth 1 -name \*.conf -type f )
+        local -a files
+        files=($("${c[@]}" 2>/dev/null)) || files=($(sudo "${c[@]}" 2>/dev/null)) || return 1
+        local f v
+        for f in "${files[@]}"; do
           f=${f##*/}; f=${f%.*}
           [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-          vpns+="$f "
+          v+="$f "
         done
-        COMPREPLY=( $(compgen -W "$vpns" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
       d|do|dow|down|s|st|sta|stat|statu|status)
         # Active VPNs in default namespace
-        for x in $(wg show interfaces); do
-          [[ $x =~ wg[0-9]+ ]] && continue
-          read -r dev x net < <(ip -br address show $x 2>/dev/null) && vpns+="$dev "
+        local -a ifaces
+        ifaces=($(wg show interfaces 2>/dev/null)) || ifaces=(sudo $(wg show interfaces 2>/dev/null)) || return 1
+        local i v
+        for i in "${ifaces[@]}"; do
+          [[ $i =~ wg[0-9]+ ]] && continue
+          /usr/sbin/ip -br address show $i 2>/dev/null && v+="$i "
         done
         # Active VPNs (namespaces)
-        while read -r ns x; do
-          sudo ip netns exec "$ns" wg show "$ns" &>/dev/null && vpns+="$ns "
-        done < <(sudo ip netns list 2>/dev/null)
-        COMPREPLY=( $(compgen -W "$vpns" -- "$cur") )
+        local n
+        while read -r n _; do
+          sudo /usr/sbin/ip netns exec "$n" wg show "$n" &>/dev/null && v+="$n "
+        done < <(/usr/sbin/ip netns list 2>/dev/null)
+        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
       e|ex|exe|exec)
         # Active VPNs (namespaces)
-        while read -r ns x; do
-          sudo ip netns exec "$ns" wg show "$ns" &>/dev/null && vpns+="$ns "
-        done < <(sudo ip netns list 2>/dev/null)
-        COMPREPLY=( $(compgen -W "$vpns" -- "$cur") )
+        local n v
+        while read -r n _; do
+          sudo /usr/sbin/ip netns exec "$n" wg show "$n" &>/dev/null && v+="$n "
+        done < <(/usr/sbin/ip netns list 2>/dev/null)
+        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
     esac
     return 0
@@ -835,6 +847,11 @@ EOF
 
   chmod 644 "$completion_file"
 
+  [[ $(stat -c %A "$CFGDIR") == *r?x ]] || \
+    warn "Completion for non-root users will use sudo to access configuration directory.
+          To avoid sudo consider: chmod o+rX '$CFGDIR' # directory only!
+          Otherwise add line for find command in sudoers as explained below.%%" fatal
+
   cat << EOF
 $Y Bash completion installed to $completion_file
 
@@ -847,7 +864,6 @@ To avoid sudo password prompt:
   sudo visudo -f /etc/sudoers.d/wgc-completion
   Then add:
   %sudo ALL=(ALL) NOPASSWD: /usr/bin/find $CFGDIR -maxdepth 1 -name *.conf -type f
-  %sudo ALL=(ALL) NOPASSWD: /usr/sbin/ip netns list
   %sudo ALL=(ALL) NOPASSWD: /usr/sbin/ip netns exec * wg show *
 EOF
 }
@@ -861,9 +877,9 @@ stop_vpn() {
   local stopping=
   if is_connected; then
     stopping=1
-    echo "Stopping $DEV ..."
+    echo "Stopping $VPN ..."
   else
-    warn "VPN $DEV is already stopped. Cleaning..."
+    warn "VPN $VPN is already stopped. Cleaning..."
   fi
 
   if [[ $HAS_NAMESPACE ]]; then
@@ -874,7 +890,7 @@ stop_vpn() {
       else
         error "Processes running in namespace $NAMESPACE:
                $(ps -fp $pids)
-               Force stop (killing processes) with: wgc down $DEV force" fatal
+               Force stop (killing processes) with: wgc down $VPN force" fatal
       fi
     fi
   fi
@@ -882,9 +898,9 @@ stop_vpn() {
   clean_vpn
 
   if is_connected; then
-    warn "VPN $DEV is still active"
+    warn "VPN $VPN is still active"
   else
-    [[ $stopping ]] && echo "$Y VPN $DEV now stopped" || true
+    [[ $stopping ]] && echo "$Y VPN $VPN now stopped" || true
   fi
 }
 
@@ -893,12 +909,12 @@ clean_vpn() {
   # Stop bridges
   if command -v systemctl >/dev/null; then
 
-    local sockets_to_stop=$(systemctl list-units --all --type=socket --no-legend --plain "wgc.${DEV}.*" | cut -d ' ' -f 1)
+    local sockets_to_stop=$(systemctl list-units --all --type=socket --no-legend --plain "wgc.${VPN}.*" | cut -d ' ' -f 1)
     if [[ $sockets_to_stop ]]; then
       systemctl stop $sockets_to_stop 2>/dev/null || true
     fi
 
-    local services_to_stop=$(systemctl list-units --all --type=service --no-legend --plain "wgc.${DEV}.*" | cut -d ' ' -f 1)
+    local services_to_stop=$(systemctl list-units --all --type=service --no-legend --plain "wgc.${VPN}.*" | cut -d ' ' -f 1)
     if [[ $services_to_stop ]]; then
       systemctl stop $services_to_stop 2>/dev/null || true
     fi
@@ -908,7 +924,7 @@ clean_vpn() {
       systemctl reset-failed $all_units 2>/dev/null || true
     fi
 
-    rm -f /run/wgc.${DEV}.*.sock 2>/dev/null || true
+    rm -f /run/wgc.${VPN}.*.sock 2>/dev/null || true
 
   fi
 
@@ -970,7 +986,7 @@ configure_vpn_in_namespace() {
   ip netns add $NAMESPACE || error "Failed to create namespace '$NAMESPACE'" fatal
   ip link set $DEV netns $NAMESPACE || error "Failed to move interface '$DEV' to namespace '$NAMESPACE'" fatal
   ip netns exec $NAMESPACE ip link set lo up || error "Failed to bring up loopback interface in namespace '$NAMESPACE'" fatal
-  # Confgure interface $DEV
+  # Configure interface $DEV
   ip netns exec $NAMESPACE ip addr add "$Address" dev $DEV || error "Failed to configure address '$Address' for interface '$DEV'" fatal
   [[ $MTU ]] && \
     ip netns exec $NAMESPACE ip link set $DEV mtu $MTU || error "Failed to configure MTU '$MTU' for interface '$DEV'" fatal
@@ -1024,9 +1040,9 @@ configure_vpn_in_namespace() {
 
       for bridge_data in "${WGC_BRIDGES[@]}"; do
         IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
-        b_sock=/run/wgc.$DEV.$b_name.sock
-        b_unit_int=wgc.$DEV.$b_name.int
-        b_unit_ext=wgc.$DEV.$b_name.ext
+        b_sock=/run/wgc.$VPN.$b_name.sock
+        b_unit_int=wgc.$VPN.$b_name.int
+        b_unit_ext=wgc.$VPN.$b_name.ext
 
         # Is external port available for listen?
         if [[ $(ss -lntH "sport = :$b_ext") ]] ; then
@@ -1132,13 +1148,13 @@ start_vpn() {
   eval "$(get_params "$@")"
 
   is_connected && \
-    error "$DEV is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
-           To reconnect, first stop it: wgc down $DEV" fatal
+    error "$VPN is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
+           To reconnect, first stop it: wgc down $VPN" fatal
 
   [[ $p_use_namespace ]] || check_openresolv
 
-  # get parameters and forwarding bridges from config file named $DEV
-  parse_config_file $DEV ${p_use_namespace:+bridges}
+  # get parameters and forwarding bridges from config file named $VPN
+  parse_config_file $VPN ${p_use_namespace:+bridges}
 
   push_cleanup clean_vpn
 
@@ -1188,7 +1204,7 @@ get_ns_pids() {
 
 show_bridges() {
   # Format: UNIT LOAD ACTIVE SUB DESCRIPTION
-  local output=$(systemctl list-units --all --full --type=service,socket --no-legend --plain "wgc.${DEV}.*")
+  local output=$(systemctl list-units --all --full --type=service,socket --no-legend --plain "wgc.${VPN}.*")
 
   if [[ $output ]]; then
     echo
@@ -1229,8 +1245,8 @@ show_bridges() {
             *)                    status_str="- $status_str" ;;
           esac
 
-          local int_unit="wgc.${DEV}.${name}.int.socket" # proxyd
-          [[ $tool == socat ]] && int_unit="wgc.${DEV}.${name}.int.service"
+          local int_unit="wgc.${VPN}.${name}.int.socket" # proxyd
+          [[ $tool == socat ]] && int_unit="wgc.${VPN}.${name}.int.service"
           local int_state="${u_active[$int_unit]:-missing}"
           [[ $int_state != active ]] && status_str+=" / Int: $X $int_state"
 
@@ -1248,7 +1264,7 @@ show_status() {
   eval "$(get_params "$@")"
 
   if is_connected; then
-    echo "$Y $DEV VPN is CONNECTED${IN_NAMESPACE:+ in namespace $NAMESPACE}"
+    echo "$Y $VPN VPN is CONNECTED${IN_NAMESPACE:+ in namespace $NAMESPACE}"
     NSCMD=${IN_NAMESPACE:+ip netns exec $NAMESPACE}
     echo
     $NSCMD wg show $DEV
@@ -1298,13 +1314,13 @@ show_status() {
       resolvconf -l $DEV || true
     fi
   else
-    warn "VPN $DEV is DISCONNECTED"
+    warn "VPN $VPN is DISCONNECTED"
   fi
 }
 
 validate_vpn_name() {
-  [[ $DEV =~ ^[a-zA-Z0-9_-]+$ ]] || \
-    error "Invalid VPN name '$DEV'. Use only alphanumeric, dash, underscore" fatal blameparent
+  [[ $VPN =~ ^[a-zA-Z0-9_-]+$ ]] || \
+    error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore" fatal blameparent
 }
 
 # -----------------------------------------------------------------------------
