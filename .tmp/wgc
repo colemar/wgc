@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # wgc - Manage multiple WireGuard VPNs using Linux network namespaces.
 # Copyright (C) 2025 Marco Coletti <colemarc@gmail.com>.
@@ -17,6 +17,116 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 
+doit() {
+  if [ -z "$BASH_VERSION" ]; then
+    echo "ERROR: This script requires Bash. Please run with 'wgc'." >&2
+    exit 1
+  fi
+  if ((BASH_VERSINFO[0] < 4)) || ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4)); then
+    echo "ERROR: Bash 4.4 or newer is required (found $BASH_VERSION)." >&2
+    exit 1
+  fi
+
+  # Set safe/trusted PATH
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  # Sanitized auto-elevation
+  [[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= SHELLOPTS= "$0" "$@"
+  [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-}${IFS:-}${SHELLOPTS:-} ]] && \
+    exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH -u IFS -u SHELLOPTS "$0" "$@"
+
+  set +vx
+  [[ ${1:-} == trace ]] && { set -vx; shift; }
+
+  # Shell status baseline
+  set +abefhkmnptuBCEHPT
+  shopt -u $(shopt | awk '/[[:space:]]on$/{print $1}')
+  # What I want
+  set +o posix       # Turn off Posix standard
+  set -o hashall     # Remember the location of commands as they are looked up.
+  set -o braceexpand # Perform brace expansion.
+  set -o errexit     # Exit immediately if a command exits with a non-zero status.
+  set -o nounset     # Treat unset variables as an error.
+  set -o pipefail    # Return value of a pipeline is the status of the last command to exit with a non-zero status.
+  set -o errtrace    # Trap ERR is inherited by functions.
+  shopt -s extglob   # Enable extended glob patterns: x(y)
+  shopt -s nullglob  # Patterns which match no files expand to a null string
+  shopt -s checkwinsize extquote
+  export LC_ALL=C LANG=C
+  local IFS=$' \t\n'
+  trap 'error TRAP fatal' ERR
+
+  (( $# == 0 )) && { show_usage; exit; }
+
+  local -r CMD=${1:-} DEV=${2:-} NAMESPACE=$DEV
+
+  local W X Y; set_markers; readonly W X Y
+  local CFGDIR; set_cfgdir; readonly CFGDIR
+  local IS_CONNECTED HAS_NAMESPACE IN_NAMESPACE
+  local Address PrivateKey PublicKey Endpoint AllowedIPs DNS MTU ListenPort PersistentKeepalive PresharedKey
+  local -a WGC_BRIDGES
+
+  case "$CMD" in
+    up|upd|n|nu|nup|d|do|dow|down|s|st|sta|stat|statu|status|e|ex|exe|exec)
+      validate_vpn_name
+      local ns=$(ip netns identify) || true
+      [[ $ns ]] && error "Usage of wgc is not supported inside a network namespace ($ns)" fatal
+      ;;
+    c|co|con|conf|p|pa|par|pars|parse)
+      validate_vpn_name
+      ;;
+  esac
+
+  case "$CMD" in
+    c|co|con|conf)
+      show_config_file
+      ;;
+    p|pa|par|pars|parse)
+      show_parsed_config_file
+      ;;
+    up)
+      start_vpn
+      ;;
+    upd)
+      start_vpn split_tunnel_route
+      ;;
+    n|nu|nup)
+      start_vpn use_namespace
+      ;;
+    d|do|dow|down)
+      stop_vpn ${3:-} # can be "force"
+      ;;
+    s|st|sta|stat|statu|status)
+      show_status bridges
+      ;;
+    e|ex|exe|exec)
+      shift 2
+      exec_in_namespace "$@"
+      ;;
+    a|ac|act|acti|activ|active)
+      show_active_vpns
+      ;;
+    l|li|lis|list)
+      list_config_files
+      ;;
+    check)
+      check_dependencies
+      ;;
+    completion)
+      enable_completion
+      ;;
+    openresolv)
+      install_forced_openresolv
+      ;;
+    remopenresolv)
+      remove_openresolv
+      ;;
+    *)
+      show_usage
+      ;;
+  esac
+}
+
 show_usage() {
   cat <<EOF
 Usage: wgc [options] [ [up|upd|nup|down|status] <vpn> | active | list | exec <vpn> <command> ]
@@ -25,14 +135,15 @@ Usage: wgc [options] [ [up|upd|nup|down|status] <vpn> | active | list | exec <vp
 Export WGC_CFGDIR to point to dir containing Wireguard *.conf files (default: /etc/wireguard).
 
 Commands (can be shortened):
-  up     - Start a VPN
-  upd    - Start a VPN and add a "split route" (0.0.0.0/1 128.0.0.0/1)
-  nup    - Start a VPN in its own net namespace
-  down   - Stop a VPN
+  up     - Start VPN
+  upd    - Start VPN and add a "split route" (0.0.0.0/1 128.0.0.0/1)
+  nup    - Start VPN in its own network namespace
+  down   - Stop VPN
   status - Show VPN status
   active - Show active VPNs
   list   - List config files
   conf   - Show config file <vpn>.conf
+  parse  - Check <vpn>.conf syntax and show values
   exec   - Execute a command in a VPN namespace
            Example: wgc <vpn> exec curl ipinfo.io
   check  - Check dependencies (required commands)
@@ -91,11 +202,10 @@ set_markers() {
     X=$'\e[01;31m'$X$'\e[m' # red CROSS MARK
     W=$'\e[01;31m'$W$'\e[m' # red BALLOT X
   fi
-  declare -gr W X Y
 }
 
 set_cfgdir() {
-  declare -gr CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
+  CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
   # Validate directory
   [[ ! -d "$CFGDIR" ]] && \
     error "Configuration directory not found: $CFGDIR
@@ -186,7 +296,7 @@ install_forced_openresolv() {
   dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tf - | grep -v '/$' | sed 's|^./|/|' > /etc/wwggcc/openresolv.files
 
   echo "Extracting directly to system..."
-  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar --keep-directory-symlink -xC /
+  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar --keep-directory-symlink --no-overwrite-dir -xC /
 
   cd ..
   rm -rf "$TEMP_DIR"
@@ -267,7 +377,6 @@ remove_openresolv() {
 
 list_config_files() {
   local f= g=
-  set_cfgdir
   echo -e "Looking in $CFGDIR\n"
   printf "%-12s %-4s %-18s %-29s %s\n" Name Br. Address Endpoint AllowedIPs
   printf "%-12s %-4s %-18s %-29s %s\n" ---- --- ------- -------- ----------
@@ -281,31 +390,35 @@ list_config_files() {
 }
 
 show_config_file() {
-  set_cfgdir
-  local config_file="$CFGDIR/$DEV.conf"
+  local -r config_file="$CFGDIR/$DEV.conf"
   [[ -f $config_file ]] || error "Not a file: $config_file"
   [[ -r $config_file ]] || error "Cannot read file: $config_file"
   printf %s\\n "$(< $config_file)"
 }
 
 show_parsed_config_file() {
-  set_cfgdir
   parse_config_file $DEV bridges
   show_config
 }
 
 show_config() {
   echo
-  for k in Address PrivateKey PublicKey PresharedKey ListenPort DNS MTU Endpoint AllowedIPs PersistentKeepalive; do
+  for k in Address DNS MTU ListenPort PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
     echo "$k=${!k}"
-    [[ $k == PrivateKey ]] && echo "    PUBLIC $(wg pubkey <<<${!k})"
+    if [[ $k ==  P*Key ]]; then
+      if wg pubkey <<<${!k} >/dev/null; then
+        [[ $k == PrivateKey ]] && echo "└── PUBLIC $(wg pubkey <<<${!k} 2>/dev/null || true)"
+      else
+        warn "Invalid $k"
+      fi
+    fi
   done
   echo
   local bridge_data b_name b_ext b_int
   printf "%-20s %s\n" "Forwarding Bridge" "ExtPort -> IntPort"
   printf "%-20s %s\n"  -----------------   ------------------
   for bridge_data in "${WGC_BRIDGES[@]}"; do
-    IFS=: read -r b_name b_ext b_int <<< $bridge_data
+    IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
     printf "%-20s %s\n" "$b_name" "$b_ext -> $b_int"
   done
 }
@@ -316,7 +429,7 @@ is_valid_port() {
 }
 
 parse_config_file() {
-  local config_file="$CFGDIR/$1.conf"
+  local -r config_file="$CFGDIR/$1.conf"
   shift 1
   local p_relax= p_bridges=
   eval "$(get_params "$@")"
@@ -326,11 +439,10 @@ parse_config_file() {
   [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
   [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
   local line= n=0 s= section= key= value= WARNINGS= BADSECTION=
-  declare -g Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= \
-    DNS= MTU= ListenPort= PersistentKeepalive= PresharedKey=
-  declare -ga WGC_BRIDGES=()
+  Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= DNS= MTU= ListenPort= PersistentKeepalive= PresharedKey=
+  WGC_BRIDGES=()
   local -A USED_BRPORTS=() USED_BRNAMES=()
-  while read -r line || [[ -n $line ]]; do # also read last line if \n is missing
+  while read -r line || [[ $line ]]; do # also read last line if \n is missing
       ((++n))
       line=${line%%#*} # Remove comments
       [[ ! $line =~ [^[:space:]] ]] && continue # Skip empty lines
@@ -346,7 +458,7 @@ parse_config_file() {
         key=${BASH_REMATCH[1]}   # key without spaces
         value=${BASH_REMATCH[2]} # value trimmed
       else # Not a key=value line
-        WARNINGS+=$'\n'"Malformed line $n: '${line:0:50}$( ((${#line} > 50)) && echo '...' )'"
+        WARNINGS+=$'\n'"Malformed line $n: '${line:0:50}$( ((${#line} > 50)) && echo ... || true )'"
         continue
       fi
       # Get values according to section/key
@@ -447,7 +559,7 @@ has_namespace() {
 }
 
 is_connected() {
-  declare -g IS_CONNECTED= HAS_NAMESPACE= IN_NAMESPACE=
+  IS_CONNECTED= HAS_NAMESPACE= IN_NAMESPACE=
 
   has_namespace && HAS_NAMESPACE=$NAMESPACE
   if ip -br link show $DEV &>/dev/null; then
@@ -461,31 +573,30 @@ is_connected() {
 }
 
 show_active_vpns() {
-  local x= ns= dev= net= found=false
-  set_cfgdir
+  local x= ns= dev= net= found=
   echo
   echo "Active VPNs in default namespace:"
   for x in $(wg show interfaces); do
     [[ $x =~ wg[0-9]+ ]] && continue
     [[ -f $CFGDIR/$x.conf ]] || continue
     if read -r dev x net < <(ip -br -c address show $x 2>/dev/null); then
-      found=true
+      found=1
       echo $dev $net
     fi
   done
-  $found || echo "  (none)"
-  found=false
+  [[ $found ]] || echo "  (none)"
+  found=
   echo
   echo "Active VPNs in other namespaces:"
   while read -r ns x; do
     dev=$ns
     if ip netns exec $ns wg show $dev &>/dev/null && \
     read -r dev x net < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null); then
-      found=true
+      found=1
       echo $dev $net
     fi
   done < <(ip netns list 2>/dev/null)
-  $found || echo "  (none)"
+  [[ $found ]] || echo "  (none)"
   echo
 }
 
@@ -583,8 +694,6 @@ get_nscd_fix_cmd() {
   [[ -f /etc/netns/$NAMESPACE/resolv.conf ]] || return 1
 
   local cmd= found=
-
-  cmd+="mount --make-rprivate / 2>/dev/null && "
 
   if [[ -S /var/run/nscd/socket ]]; then
     cmd+="mount -t tmpfs -o size=1M,mode=755 none /var/run/nscd && "
@@ -726,7 +835,6 @@ EOF
 
   chmod 644 "$completion_file"
 
-set_cfgdir
   cat << EOF
 $Y Bash completion installed to $completion_file
 
@@ -747,12 +855,21 @@ EOF
 
 
 stop_vpn() {
-  local force=${1:-}
+  local p_force=
+  eval "$(get_params "$@")"
 
-  if has_namespace; then
+  local stopping=
+  if is_connected; then
+    stopping=1
+    echo "Stopping $DEV ..."
+  else
+    warn "VPN $DEV is already stopped. Cleaning..."
+  fi
+
+  if [[ $HAS_NAMESPACE ]]; then
     local pids=$(get_ns_pids)
     if [[ $pids ]]; then
-      if [[ $force == force ]]; then
+      if [[ $p_force ]]; then
         kill_processes "$pids"
       else
         error "Processes running in namespace $NAMESPACE:
@@ -765,9 +882,9 @@ stop_vpn() {
   clean_vpn
 
   if is_connected; then
-    warn "VPN $DEV is still connected"
+    warn "VPN $DEV is still active"
   else
-    echo "$Y VPN $DEV is disconnected"
+    [[ $stopping ]] && echo "$Y VPN $DEV now stopped" || true
   fi
 }
 
@@ -906,7 +1023,7 @@ configure_vpn_in_namespace() {
       [[ -e $netns_path ]] || error "Cannot locate netns file for '$NAMESPACE'" fatal
 
       for bridge_data in "${WGC_BRIDGES[@]}"; do
-        IFS=: read -r b_name b_ext b_int <<< $bridge_data
+        IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
         b_sock=/run/wgc.$DEV.$b_name.sock
         b_unit_int=wgc.$DEV.$b_name.int
         b_unit_ext=wgc.$DEV.$b_name.ext
@@ -977,7 +1094,9 @@ configure_vpn_plain() {
 
   # Add a "split tunnel route" if wanted
   if [[ $p_split_tunnel_route ]]; then
-    q=($(ip route get ${Endpoint%%:*} 2>/dev/null)) && [[ $q ]] || error "Cannot find route to endpoint ${Endpoint%%:*}" fatal
+    local -a q
+    q=($(ip route get "${Endpoint%%:*}" 2>/dev/null)) && [[ ${q[@]:0:3} ]] || \
+      error "Cannot find route to endpoint ${Endpoint%%:*}" fatal
     # Add specific route to protect WireGuard UDP Stateless Tunnel to Endpoint
     ip route replace ${q[@]:0:3} || error "Cannot set route to endpoint ${Endpoint%%:*}" fatal
     ip route add 0/1 dev $DEV
@@ -1015,8 +1134,6 @@ start_vpn() {
   is_connected && \
     error "$DEV is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
            To reconnect, first stop it: wgc down $DEV" fatal
-
-  set_cfgdir
 
   [[ $p_use_namespace ]] || check_openresolv
 
@@ -1167,8 +1284,8 @@ show_status() {
         local addr=${BASH_REMATCH[0]}
         echo "Rules:"
         ip rule list from $addr | grep -F --color "from $addr" || echo "  (none)"
-        local x= t=
-        while read -r x x x x t; do
+        local t=
+        while read -r _ _ _ _ t; do
           echo
           echo "Routing table $t:"
           ip -c route show table $t
@@ -1223,24 +1340,16 @@ pop_cleanup() {
 # - Graceful cleanup even when cleanup functions fail
 # - Multi-line message support (using %% or actual newlines)
 error() {
-  local exit_code=$?
+  local exit_code=$?  msg=$1; shift
+  local p_fatal= p_blameparent=
+  eval "$(get_params "$@")"
 
-  local original_trap=$(trap -p ERR)
-  local original_opts=$-
+  local original_trap=$(trap -p ERR) original_opts=$-
   trap - ERR; set +e
 
-  local msg=$1
+  local line=${BASH_LINENO[0]}
 
-  local arg= fatal=false blameparent=false line=${BASH_LINENO[0]}
-  for arg in "${@:2}"; do
-    case $arg in
-      fatal) fatal=true ;;
-      blameparent ) blameparent=true ;;
-      *) echo "WARNING: Unknown error flag '$arg' at line $line" >&2 ;; # Debug safe
-    esac
-  done
-
-  $blameparent && line=${BASH_LINENO[1]}
+  [[ $p_blameparent ]] && line=${BASH_LINENO[1]}
 
   case "$msg" in
     "")
@@ -1248,7 +1357,7 @@ error() {
     TRAP)
       echo "${X}ERROR @$line: Command '$BASH_COMMAND' failed with exit code $exit_code" >&2
       show_traceback >&2
-      fatal=true
+      p_fatal=1
       ;;
     *)
       indent_multiline msg
@@ -1256,7 +1365,7 @@ error() {
       ;;
   esac
 
-  if $fatal; then
+  if [[ $p_fatal ]]; then
     # unwind of CLEANUP_STACK
     local k=
     for (( k=${#CLEANUP_STACK[@]}-1; k>=0; k-- )); do
@@ -1294,82 +1403,8 @@ warn() {
 indent_multiline() {
   local -n _ref=$1
   # %% or newline means: newline and indent 2
-  #_ref=$(sed -z -E 's/[[:blank:]]*(%%|\n)[[:blank:]]*/\n  /g' <<< "${_ref}")
   _ref=$(printf %s "${_ref}" | sed -z -E 's/[[:blank:]]*(%%|\n)[[:blank:]]*/\n  /g')
 }
 
 # -----------------------------------------------------------------------------
-set_markers
-(( $# == 0 )) && { show_usage; exit; }
-[[ $1 == trace ]] && { set -x; shift; }
-ns=$(ip netns identify)
-[[ $ns ]] && error "Usage of wgc is not supported in a network namespace ($ns)" fatal
-
-CMD=${1:-}
-DEV=${2:-}
-
-[[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" "$0" "$@"
-
-set -e          # Exit immediately if a command exits with a non-zero status.
-set -u          # Treat unset variables as an error.
-set -o pipefail # Return value of a pipeline is the status of the last command to exit with a non-zero status.
-set -o errtrace # Trap ERR is inherited by functions.
-shopt -s extglob # Enable extended glob patterns: x(y)
-shopt -s nullglob
-unset IFS
-
-NAMESPACE=$DEV
-declare -r CMD DEV NAMESPACE
-
-trap 'error TRAP fatal' ERR
-
-[[ $CMD == @(up|upd|n|nu|nup|d|do|dow|down|s|st|sta|stat|statu|status|e|ex|exe|exec) ]] && validate_vpn_name
-
-case "$CMD" in
-  c|co|con|conf)
-    show_config_file
-    ;;
-  p|pa|par|pars|parse)
-    show_parsed_config_file
-    ;;
-  up)
-    start_vpn
-    ;;
-  upd)
-    start_vpn split_tunnel_route
-    ;;
-  n|nu|nup)
-    start_vpn use_namespace
-    ;;
-  d|do|dow|down)
-    stop_vpn ${3:-} # can be "force"
-    ;;
-  s|st|sta|stat|statu|status)
-    show_status bridges
-    ;;
-  e|ex|exe|exec)
-    shift 2
-    exec_in_namespace "$@"
-    ;;
-  a|ac|act|acti|activ|active)
-    show_active_vpns
-    ;;
-  l|li|lis|list)
-    list_config_files
-    ;;
-  check)
-    check_dependencies
-    ;;
-  completion)
-    enable_completion
-    ;;
-  openresolv)
-    install_forced_openresolv
-    ;;
-  remopenresolv)
-    remove_openresolv
-    ;;
-  *)
-    show_usage
-    ;;
-esac
+[[ ${BASH_SOURCE[0]} == $0 ]] && doit "$@"
