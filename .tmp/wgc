@@ -61,7 +61,7 @@ doit() {
 
   local -r CMD=${1:-} VPN=${2:-}
   local DEV=wgc_${VPN:-}
-  local NAMESPACE=${VPN:-}
+  local NAMESPACE=$DEV
 
   local W X Y; set_markers; readonly W X Y
   local CFGDIR; set_cfgdir; readonly CFGDIR
@@ -402,30 +402,37 @@ show_config_file() {
 }
 
 show_parsed_config_file() {
-  parse_config_file $VPN bridges
+  parse_config_file $VPN bridges report
   show_config
 }
 
 show_config() {
   echo
+  printf "%-20s %s\n" Key Value
+  printf "%-20s %s\n" ---- -----
+  local pub
   for k in Address DNS MTU ListenPort PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
-    echo "$k=${!k}"
+    printf "%-20s %s" $k "${!k:-  (missing)}"
     if [[ $k ==  P*Key ]]; then
-      if wg pubkey <<<${!k} >/dev/null; then
-        [[ $k == PrivateKey ]] && echo "└── PUBLIC $(wg pubkey <<<${!k} 2>/dev/null || true)"
+      if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
+        [[ $k == PrivateKey ]] && printf "\n└── %-16s %s" "PUBLIC" "$pub"
       else
-        warn "Invalid $k"
+        printf "%s" " $W Invalid"
       fi
     fi
+    printf "\n"
   done
+  if (( ${#WGC_BRIDGES[@]} > 0 )); then
+    echo
+    local bridge_data b_name b_ext b_int
+    printf "%-20s %s\n" "Forwarding Bridge" "ExtPort -> IntPort"
+    printf "%-20s %s\n"  -----------------   ------------------
+    for bridge_data in "${WGC_BRIDGES[@]}"; do
+      IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
+      printf "%-20s %s\n" "$b_name" "$b_ext -> $b_int"
+    done
+  fi
   echo
-  local bridge_data b_name b_ext b_int
-  printf "%-20s %s\n" "Forwarding Bridge" "ExtPort -> IntPort"
-  printf "%-20s %s\n"  -----------------   ------------------
-  for bridge_data in "${WGC_BRIDGES[@]}"; do
-    IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
-    printf "%-20s %s\n" "$b_name" "$b_ext -> $b_int"
-  done
 }
 
 is_valid_port() {
@@ -436,14 +443,14 @@ is_valid_port() {
 parse_config_file() {
   local -r config_file="$CFGDIR/$1.conf"
   shift 1
-  local p_relax= p_bridges=
+  local p_relax= p_bridges= p_report=
   eval "$(get_params "$@")"
 
   local fatal=fatal; [[ $p_relax ]] && fatal=
 
   [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
   [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
-  local line= n=0 s= section= key= value= WARNINGS= BADSECTION=
+  local line= n=0 s=0 section= key= value= ISSUES= BADSECTION=BADSECTION
   Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= DNS= MTU= ListenPort= PersistentKeepalive= PresharedKey=
   WGC_BRIDGES=()
   local -A USED_BRPORTS=() USED_BRNAMES=()
@@ -457,23 +464,28 @@ parse_config_file() {
         continue
       fi
       # Skip lines in bad sections (even before all sections)
-      [[ $section == $BADSECTION ]] && continue
+      [[ $section == "$BADSECTION" ]] && continue
       # Parse key=value with flexible spacing
       if [[ $line =~ ^[[:space:]]*([A-Za-z0-9]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]]) ]]; then
         key=${BASH_REMATCH[1]}   # key without spaces
         value=${BASH_REMATCH[2]} # value trimmed
       else # Not a key=value line
-        WARNINGS+=$'\n'"Malformed line $n: '${line:0:50}$( ((${#line} > 50)) && echo ... || true )'"
+        ISSUES+=$'\n'"Malformed line $n: ${line:0:50}$( ((${#line} > 50)) && echo ... || true )"
         continue
       fi
       # Get values according to section/key
       process_config_line $s $n "$key" "$value" "$section"
   done < "$config_file"
   if [[ ! $p_relax ]]; then
-    [[ "$WARNINGS" ]] && warn "Skipping invalid entries in $config_file:$WARNINGS"
     for n in Address PrivateKey PublicKey Endpoint AllowedIPs; do
-      [[ ${!n} ]] || error "Missing required key '$n' in file $config_file" fatal blameparent
+      [[ ${!n} ]] || \
+        if [[ $p_report ]]; then
+          ISSUES+=$'\n'"Missing required key '$n'"
+        else
+          error "Missing required key '$n' in file $config_file" fatal blameparent
+        fi
     done
+    [[ $ISSUES ]] && warn "Issues in $config_file:$ISSUES" || true
   fi
 }
 
@@ -488,7 +500,7 @@ process_config_line() {
         MTU) MTU=$value ;;
         PrivateKey) PrivateKey=$value ;;
         ListenPort) ListenPort=$value ;;
-        *) WARNINGS+=$'\n'"Unknown key '$key' in section '$section' at line $n" ;;
+        *) ISSUES+=$'\n'"Unknown key '$key' in section '$section' at line $n" ;;
       esac
       ;;
     "[Peer]")
@@ -498,7 +510,7 @@ process_config_line() {
         PersistentKeepalive) PersistentKeepalive=$value ;;
         PresharedKey) PresharedKey=$value ;;
         PublicKey) PublicKey=$value ;;
-        *) WARNINGS+=$'\n'"Unknown key '$key' in section '$section' at line $n" ;;
+        *) ISSUES+=$'\n'"Unknown key '$key' in section '$section' at line $n" ;;
       esac
       ;;
     "[WGC-Bridges]")
@@ -506,34 +518,34 @@ process_config_line() {
       # Sintax: <bridgename> = <externalport>-<internalport>
       # Example: qBittorrent = 8765-8765
       if [[ ! $key =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        WARNINGS+=$'\n'"Invalid bridge name '$key' at line $n (chars allowed: A-Z, a-z, 0-9, _, -)"
+        ISSUES+=$'\n'"Invalid bridge name '$key' at line $n (chars allowed: A-Z, a-z, 0-9, _, -)"
         return
       fi
       if [[ -v USED_BRNAMES[$key] ]]; then
-        WARNINGS+=$'\n'"Duplicate bridge name '$key' at lines $n and ${USED_BRNAMES[$key]}"
+        ISSUES+=$'\n'"Duplicate bridge name '$key' at lines $n and ${USED_BRNAMES[$key]}"
         return
       fi
       if [[ $value =~ ^([0-9]+)[[:space:]]*-[[:space:]]*([0-9]+)$ ]]; then
         local ext_port="${BASH_REMATCH[1]}"
         local int_port="${BASH_REMATCH[2]}"
         if ! is_valid_port $ext_port || ! is_valid_port $int_port; then
-          WARNINGS+=$'\n'"Invalid port at line $n (must be 1-65535): $value"
+          ISSUES+=$'\n'"Invalid port at line $n (must be 1-65535): $value"
           return
         fi
         if [[ -v USED_BRPORTS[$ext_port] ]]; then
-          WARNINGS+=$'\n'"Duplicate external port $ext_port for bridge '$key' at line $n (already used by '${USED_BRPORTS[$ext_port]}')"
+          ISSUES+=$'\n'"Duplicate external port $ext_port for bridge '$key' at line $n (already used by '${USED_BRPORTS[$ext_port]}')"
           return
         fi
         USED_BRNAMES[$key]=$n
         USED_BRPORTS[$ext_port]=$key
         WGC_BRIDGES+=("$key:$ext_port:$int_port")
       else
-        WARNINGS+=$'\n'"Invalid bridge format at line $n. Use: external-internal (e.g., 4321-1234)"
+        ISSUES+=$'\n'"Invalid bridge format '$value' at line $n. Use: external-internal (e.g., 4321-1234)"
       fi
       ;;
     *)
       BADSECTION=$section
-      WARNINGS+=$'\n'"Unknown section '$section' at line $s"
+      ISSUES+=$'\n'"Unknown section '$section' at line $s"
       ;;
   esac
 }
@@ -582,8 +594,7 @@ show_active_vpns() {
   echo
   echo "Active VPNs in default namespace:"
   for x in $(wg show interfaces); do
-    [[ $x =~ wg[0-9]+ ]] && continue
-    [[ -f $CFGDIR/$x.conf ]] || continue
+    [[ $x == wgc_* ]] || continue
     if read -r dev x net < <(ip -br -c address show $x 2>/dev/null); then
       found=1
       echo $dev $net
@@ -798,13 +809,13 @@ _wgc_completion() {
         ifaces=($(wg show interfaces 2>/dev/null)) || ifaces=(sudo $(wg show interfaces 2>/dev/null)) || return 1
         local i v
         for i in "${ifaces[@]}"; do
-          [[ $i =~ wg[0-9]+ ]] && continue
-          /usr/sbin/ip -br address show $i 2>/dev/null && v+="$i "
+          [[ $i == wgc_* ]] || continue
+          v+="${i#*wgc_} "
         done
         # Active VPNs (namespaces)
         local n
         while read -r n _; do
-          sudo /usr/sbin/ip netns exec "$n" wg show "$n" &>/dev/null && v+="$n "
+          sudo /usr/sbin/ip netns exec "$n" wg show "$n" &>/dev/null && v+="${n#*wgc_} "
         done < <(/usr/sbin/ip netns list 2>/dev/null)
         COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
@@ -812,7 +823,7 @@ _wgc_completion() {
         # Active VPNs (namespaces)
         local n v
         while read -r n _; do
-          sudo /usr/sbin/ip netns exec "$n" wg show "$n" &>/dev/null && v+="$n "
+          sudo /usr/sbin/ip netns exec "$n" wg show "$n" &>/dev/null && v+="${n#*wgc_} "
         done < <(/usr/sbin/ip netns list 2>/dev/null)
         COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
@@ -1289,9 +1300,9 @@ show_status() {
       local pids=$(get_ns_pids)
       [[ $pids ]] && ps -fp $pids || echo "  (none)"
       echo
-      echo "To run commands in the VPN namespace:"
-      echo "  wgc exec $NAMESPACE <command>"
-      echo "  Example: wgc exec $NAMESPACE curl ipinfo.io"
+      echo "To run commands in the VPN namespace $NAMESPACE:"
+      echo "  wgc exec $VPN <command>"
+      echo "  Example: wgc exec $VPN curl ipinfo.io"
     else
       echo "Routes:"
       ip -c route show | grep -F --color $DEV || echo "  (none)"
@@ -1373,7 +1384,6 @@ error() {
     TRAP)
       echo "${X}ERROR @$line: Command '$BASH_COMMAND' failed with exit code $exit_code" >&2
       show_traceback >&2
-      p_fatal=1
       ;;
     *)
       indent_multiline msg
@@ -1423,4 +1433,4 @@ indent_multiline() {
 }
 
 # -----------------------------------------------------------------------------
-[[ ${BASH_SOURCE[0]} == $0 ]] && doit "$@"
+[[ ${BASH_SOURCE[0]} == "$0" ]] && doit "$@"
