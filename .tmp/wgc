@@ -219,91 +219,68 @@ set_markers() {
     Y=$'\e[1;32m'$Y$'\e[m' # green CHECK MARK
     X=$'\e[1;31m'$X$'\e[m' # red CROSS MARK
     W=$'\e[1;31m'$W$'\e[m' # red BALLOT X
-    # colors
-    # 0:Black(Ash), 1:Red, 2:Green, 3:Yellow, 4:Blue, 5:Magenta, 6:Cyan, 7:White
-    local chars=argybmcw i k
-    for ((i=0; i<8; i++)); do
-      k=${chars:i:1}
-      COLORS[$k]=$'\e[0;3'$i'm'    # Lowercase: Normal
-      COLORS[${k^}]=$'\e[1;3'$i'm' # Uppercase: Bold/Bright
-    done
-    COLORS[/]=$'\e[m'
     HAS_COLORS=1
   fi
+  # colors
+  # 0:Black(Ash), 1:Red, 2:Green, 3:Yellow, 4:Blue, 5:Magenta, 6:Cyan, 7:White
+  local chars=argybmcw i k
+  for ((i=0; i<8; i++)); do
+    k=${chars:i:1}
+    COLORS[$k]=$'\e[0;3'$i'm'    # Lowercase: Normal
+    COLORS[${k^}]=$'\e[1;3'$i'm' # Uppercase: Bold/Bright
+  done
+  COLORS[/]=$'\e[m'
 }
 
-# prc - Print with color
-# Usage: prc [[C]FORMAT] [ARGS...]
+# prc - Print with color - A wrapper around printf
+# Usage: prc [FORMAT] [ARGS...]
 #
-# If C is one of ARGYBMCWargybmcw, color is applied as follows:
+# If +x is one of +[ARGYBMCWargybmcw/], color is applied as follows:
 #   Bright color: A:gray R:red G:green Y:yellow B:blue M:magenta C:cyan W:white
 #   Normal color: a      r     g       y        b      m         c      w
+#   Reset color: /
 # COLORS array maps letters to ANSI color codes.
 #
-# FORMAT: printf-style format string (default: %s)
+# FORMAT: printf-style format string (default: %s) plus +x syntax.
 #
-# In short, it works exactly as printf, with three exceptions:
-# - If arg $1 begins with one of ARGYBMCWargybmcw, color is also applied
-#   and the remaining of $1 (FORMAT) is used as printf format.
+# In short, it works exactly as printf, with these exceptions:
+# - In addition to %x format characters it recognizes +x format codes.
+# - If x in +x is not a color code, it results in x (e.g. ++ == +).
 # - If FORMAT is empty, format %s is assumed.
 # - If there is only arg $1, it is printed literally (no orphaned format specifiers).
 #
 # Examples:
-#   prc "R%s\n" "Error: 234" # prints "Error: 234" in Bright Red + newline
-#   prc "RError: %d\n" 234   # equivalent, but somewhat obscure
-#   prc R%s "Error: 234"     # prints "Error: 234" in Bright Red
-#   prc R%s%d "Error: " 0xEA # equivalent
-#   prc R "Error: 234"       # equivalent
-#   prc "g%s" Success        # prints "Success" in Normal Green
-#   prc "gSuccess"           # prints "gSuccess" without ANSI color codes
-#   prc "%dSuccess"          # prints "%dSuccess"
-#   prc "%d files\n" 42      # prints "42 files" with no color + newline
-prx() {
-  local fmt=$1 color=
-
-  if (( $# > 1 )); then
-    # fmt is indeed a format
-    if [[ $fmt == [ARGYBMCWargybmcw]* ]]; then
-      # fmt first letter is a color, consume it
-      color=${fmt:0:1}
-      fmt=${fmt:1}; fmt=${fmt:-%s}
-    fi
-    shift # adjust "$@"
-  else
-    # fmt is a message -> set default format
-    fmt=%s
-  fi
-
-  if [[ $HAS_COLORS && $color ]]; then
-    #printf "%s$fmt\e[m" "${COLORS[$color]}" "$@"
-    printf "${COLORS[$color]}$fmt\e[m" "$@"
-  else
-    printf "$fmt" "$@"
-  fi
-}
-
+#   prc "+R%s+/\n" "Error: 234"    # prints "Error: 234" in Bright Red + newline
+#   prc "+RError: %d+/\n" 234      # equivalent
+#   prc +R%s+/ "Error: 234"        # prints "Error: 234" in Bright Red
+#   prc +R%s%d+/ "Error: " 0xEA    # equivalent
+#   prc "+R%s +Y%d+/" "Error:" 234 # prints a red "Error: " followed by a yellow 234
+#   prc +g%s+/ Success             # prints "Success" in Normal Green
+#   prc "+gSuccess+/"              # prints "+gSuccess+/" without ANSI color codes
+#   prc "%dSuccess"                # prints "%dSuccess"
+#   prc "%d files\n" 42            # prints "42 files" with no color + newline
+#
 prc() {
-  local fmt=$1 l r
+  local fmt=$1 l r k
 
   if (( $# > 1 )); then
-    # fmt is indeed a format
+    fmt=$fmt+ # fmt is indeed a format, append sentinel character
     while : ; do
-      r=${fmt#*+}
-      [[ $r == "$fmt" ]] && { l+=$r; break; }
-      l+=${fmt%%+*}
-      case "$r" in
-        /*)
-          l+=${HAS_COLORS:+$'\e[m'} # +/ means color end
-          ;;
-        [ARGYBMCWargybmcw]*)
-          l+=${HAS_COLORS:+${COLORS[${r:0:1}]}} # color start
-          ;;
-        *)
-          l+=${r:0:1} # +x where x is not a color means x
-          ;;
-      esac
-      fmt=${r:1}
+      k=${fmt%%+*}   # k = anything before +
+      r=${fmt#"$k+"} # r = anything after +
+      l+=$k
+      [[ $r ]] || break
+      k=${COLORS[${r:0:1}]:-}
+      if [[ $k ]]; then
+        # char after + is a color code and $k is the corresponding ANSI code
+        l+=${HAS_COLORS:+$k}
+      else
+        # +x where x is not a color code means x (++ is about the only real-world case)
+        l+=${r:0:1}
+      fi
+      fmt=${r:1} # consider remaining fmt
     done
+    l=${l:-%s}
     shift # adjust "$@"
   else
     # fmt is a message -> set default format
@@ -518,16 +495,13 @@ show_config() {
   prc "%-20s%s\n"     ---- -----
   local pub
   for k in Address DNS MTU ListenPort PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
-    prc +c%-20s+/ $k
-    prc "+c%-20s+Y${!k:++/}%s+/" "$k" "${!k:-(missing)}"
-    proc"+c%-20s+/%s" $k "${!k:-${COLORS[Y]}(missing)${COLORS[/]}}"
-    prc "+c%-20s+/${k:-+Y(missing)+/}" $k
-    [[ ${!k} ]] && prc "${!k}" || prc +Y%s+/ "(missing)"
+    #prc "+c%-20s+/%s" $k "${!k:-${COLORS[Y]}(missing)${COLORS[/]}}"
+    prc "+c%-20s+Y${!k:++/}%s+/" $k "${!k:-(missing)}"
     if [[ $k ==  P*Key ]]; then
       if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
-        [[ $k == PrivateKey ]] && prx "\n└── %-15s %s" "PUBLIC" "$pub"
+        [[ $k == PrivateKey ]] && prc "\n└── %-15s %s" "PUBLIC" "$pub"
       else
-        prx R $' \u2717 Invalid'
+        prc +R%s+/ $' \u2717 Invalid'
       fi
     fi
     printf "\n"
