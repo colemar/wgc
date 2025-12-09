@@ -21,27 +21,6 @@
 # [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
 doit() {
-  local is_interactive=
-  [[ $- == *i* ]] && is_interactive=1
-  if [[ $is_interactive ]]; then
-    local interactive_state=$(shopt -p; set +o | grep -v history)
-  fi
-
-  safe_exit() {
-    set +vx # disable trace if enabled
-    local ret=${1:-0}
-    if [[ $is_interactive ]]; then
-      local h='+o history'
-      [[ -o history ]] && h='-o history'
-      set +o history # disable history to prevent history pollution by eval
-      set +o errexit # prevent possible eval crash
-      eval "$interactive_state"
-      set $h # restore history state
-      return $ret
-    fi
-    exit $ret
-  }
-
   # Set safe/trusted PATH
   export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -54,13 +33,11 @@ doit() {
     safe_exit 1
   fi
 
-  if [[ ! $is_interactive ]]; then
-    # Sanitized auto-elevation
-    [[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
-    # unset fails when readonly, so use exec env -i
-    [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
-      exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
-  fi
+  # Sanitized auto-elevation
+  [[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
+  # unset fails when readonly, so use exec env -i
+  [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
+    exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
 
   set +vx
   [[ ${1:-} == trace ]] && { set -vx; shift; }
@@ -74,16 +51,14 @@ doit() {
   set -o braceexpand # Perform brace expansion.
   set -o nounset     # Treat unset variables as an error.
   set -o pipefail    # Return value of a pipeline is the status of the last command to exit with a non-zero status.
+  set -o errexit   # Exit immediately if a command exits with a non-zero status.
+  set -o errtrace  # Trap ERR is inherited by functions.
+  trap 'error TRAP fatal' ERR
   shopt -s extglob   # Enable extended glob patterns: x(y)
   shopt -s nullglob  # Patterns which match no files expand to a null string
   shopt -s checkwinsize extquote
   export LC_ALL=C LANG=C
   local IFS=$' \t\n'
-  if [[ ! $is_interactive ]]; then
-    set -o errexit   # Exit immediately if a command exits with a non-zero status.
-    set -o errtrace  # Trap ERR is inherited by functions.
-    trap 'error TRAP fatal' ERR
-  fi
 
   (( $# == 0 )) && { show_usage; safe_exit; }
 
@@ -167,7 +142,6 @@ doit() {
       show_usage
       ;;
   esac
-  safe_exit
 }
 
 show_usage() {
@@ -246,10 +220,14 @@ set_markers() {
     X=$'\e[1;31m'$X$'\e[m' # red CROSS MARK
     W=$'\e[1;31m'$W$'\e[m' # red BALLOT X
     # colors
-     COLORS=( [A]=$'\e[1;30m' [R]=$'\e[1;31m' [G]=$'\e[1;32m' [Y]=$'\e[1;33m' )
-    COLORS+=( [B]=$'\e[1;34m' [M]=$'\e[1;35m' [C]=$'\e[1;36m' [W]=$'\e[1;37m' )
-    COLORS+=( [a]=$'\e[30m'   [r]=$'\e[31m'   [g]=$'\e[32m'   [y]=$'\e[33m'   )
-    COLORS+=( [b]=$'\e[34m'   [m]=$'\e[35m'   [c]=$'\e[36m'   [w]=$'\e[37m'   )
+    # 0:Black(Ash), 1:Red, 2:Green, 3:Yellow, 4:Blue, 5:Magenta, 6:Cyan, 7:White
+    local chars=argybmcw i k
+    for ((i=0; i<8; i++)); do
+      k=${chars:i:1}
+      COLORS[$k]=$'\e[0;3'$i'm'    # Lowercase: Normal
+      COLORS[${k^}]=$'\e[1;3'$i'm' # Uppercase: Bold/Bright
+    done
+    COLORS[/]=$'\e[m'
     HAS_COLORS=1
   fi
 }
@@ -280,7 +258,7 @@ set_markers() {
 #   prc "gSuccess"           # prints "gSuccess" without ANSI color codes
 #   prc "%dSuccess"          # prints "%dSuccess"
 #   prc "%d files\n" 42      # prints "42 files" with no color + newline
-prc() {
+prx() {
   local fmt=$1 color=
 
   if (( $# > 1 )); then
@@ -302,6 +280,37 @@ prc() {
   else
     printf "$fmt" "$@"
   fi
+}
+
+prc() {
+  local fmt=$1 l r
+
+  if (( $# > 1 )); then
+    # fmt is indeed a format
+    while : ; do
+      r=${fmt#*+}
+      [[ $r == "$fmt" ]] && { l+=$r; break; }
+      l+=${fmt%%+*}
+      case "$r" in
+        /*)
+          l+=${HAS_COLORS:+$'\e[m'} # +/ means color end
+          ;;
+        [ARGYBMCWargybmcw]*)
+          l+=${HAS_COLORS:+${COLORS[${r:0:1}]}} # color start
+          ;;
+        *)
+          l+=${r:0:1} # +x where x is not a color means x
+          ;;
+      esac
+      fmt=${r:1}
+    done
+    shift # adjust "$@"
+  else
+    # fmt is a message -> set default format
+    l=%s
+  fi
+
+  printf "$l" "$@"
 }
 
 set_cfgdir() {
@@ -505,17 +514,20 @@ show_parsed_config_file() {
 
 show_config() {
   echo
-  printf "%-20s%s\n" Key Value
-  printf "%-20s%s\n" ---- -----
+  prc "+W%-20s%s+/\n" Key  Value
+  prc "%-20s%s\n"     ---- -----
   local pub
   for k in Address DNS MTU ListenPort PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
-    prc c%-20s $k
-    [[ ${!k} ]] && prc %s "${!k}" || prc "(missing)" Y
+    prc +c%-20s+/ $k
+    prc "+c%-20s+Y${!k:++/}%s+/" "$k" "${!k:-(missing)}"
+    proc"+c%-20s+/%s" $k "${!k:-${COLORS[Y]}(missing)${COLORS[/]}}"
+    prc "+c%-20s+/${k:-+Y(missing)+/}" $k
+    [[ ${!k} ]] && prc "${!k}" || prc +Y%s+/ "(missing)"
     if [[ $k ==  P*Key ]]; then
       if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
-        [[ $k == PrivateKey ]] && printf "\n└── %-16s %s" "PUBLIC" "$pub"
+        [[ $k == PrivateKey ]] && prx "\n└── %-15s %s" "PUBLIC" "$pub"
       else
-        printf "%s" " $W Invalid"
+        prx R $' \u2717 Invalid'
       fi
     fi
     printf "\n"
@@ -523,11 +535,11 @@ show_config() {
   if (( ${#WGC_BRIDGES[@]} > 0 )); then
     echo
     local bridge_data b_name b_ext b_int
-    printf "%-20s%s\n" "Forwarding Bridge" "ExtPort -> IntPort"
-    printf "%-20s%s\n"  -----------------   ------------------
+    prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
+    prc "%-20s%s\n"      -----------------   ------------------
     for bridge_data in "${WGC_BRIDGES[@]}"; do
       IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
-      printf "%-20s%s\n" "$b_name" "$b_ext -> $b_int"
+      prc "+y%-20s+/%s\n" "$b_name" "$b_ext -> $b_int"
     done
   fi
   echo
