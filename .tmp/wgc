@@ -17,24 +17,28 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 
-# Guard against sourcing. Enable before release!
-# [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
+# Guard against sourcing.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
 doit() {
   # Set safe/trusted PATH
+  local ORIG_PATH=$PATH
   export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
   if [ -z "$BASH_VERSION" ]; then
     echo "ERROR: This script requires Bash. Please run with 'wgc'." >&2
-    safe_exit 1
+    exit 1
   fi
   if ((BASH_VERSINFO[0] < 4)) || ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4)); then
     echo "ERROR: Bash 4.4 or newer is required (found $BASH_VERSION)." >&2
-    safe_exit 1
+    exit 1
   fi
 
   # Sanitized auto-elevation
-  [[ $UID == 0 ]] || exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
+  if [[ ! $UID == 0 ]]; then
+    PATH=$ORIG_PATH # restore original PATH because exec_in_namespace() recovers it
+    exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
+  fi
   # unset fails when readonly, so use exec env -i
   [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
     exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
@@ -60,7 +64,7 @@ doit() {
   export LC_ALL=C LANG=C
   local IFS=$' \t\n'
 
-  (( $# == 0 )) && { show_usage; safe_exit; }
+  (( $# == 0 )) && { show_usage; exit; }
 
   local -r CMD=${1:-} VPN=${2:-}
   local DEV=wgc_${VPN:-}
@@ -94,7 +98,7 @@ doit() {
       start_vpn
       ;;
     upd)
-      start_vpn split_tunnel_route
+      start_vpn override_default_route
       ;;
     n|nu|nup)
       start_vpn use_namespace
@@ -115,7 +119,7 @@ doit() {
     l|li|lis|list)
       list_config_files
       ;;
-    check)
+    r|re|req)
       check_dependencies
       ;;
     completion)
@@ -146,27 +150,40 @@ doit() {
 
 show_usage() {
   cat <<EOF
-Usage: wgc [options] [ [up|upd|nup|down|state] <vpn> | active | list | exec <vpn> <command> ]
+Usage:
+  wgc <command> [<vpn>]
+  wgc exec <vpn> <command>
 
-<vpn> should match a config file name \$WGC_CFGDIR/<vpn>.conf
-Export WGC_CFGDIR to point to dir containing Wireguard *.conf files (default: /etc/wireguard).
+Core Commands:
+  up <vpn>    - Start VPN in Split Tunnel mode.
+                (Uses AllowedIPs, but ignores 0.0.0.0/0 to keep default gateway)
+  upd <vpn>   - Start VPN in Full Tunnel mode overriding default gateway.
+                (Forces all traffic through VPN via override routes 0/1, 128/1)
+  nup <vpn>   - Start VPN in a dedicated Network Namespace (isolated stack).
+  down <vpn>  - Stop the VPN and clean up routes.
 
-Commands (can be shortened):
-  up     - Start VPN
-  upd    - Start VPN and add a "split route" (0.0.0.0/1 128.0.0.0/1)
-  nup    - Start VPN in its own network namespace
-  down   - Stop VPN
-  state  - Show VPN state
-  active - Show active VPNs
-  list   - List config files
-  conf   - Show config file <vpn>.conf
-  parse  - Check <vpn>.conf syntax and show values
-  exec   - Execute a command in a VPN namespace
-           Example: wgc <vpn> exec curl ipinfo.io
-  check  - Check dependencies (required commands)
+Inspection & Utils:
+  state <vpn> - Show detailed state of a specific VPN.
+  active      - List only active VPN interfaces.
+  list        - List all available config files.
+  conf <vpn>  - Display the content of <vpn>.conf.
+  parse <vpn> - Check syntax and show parsed parameters for <vpn>.conf.
+  req         - Verify that required dependencies are installed.
 
-To enable bash completion: wgc completion
-Redo completion if WGC_CFGDIR is changed.
+Execution:
+  exec <vpn>  - Run a command inside the VPN Network Namespace.
+                (Only valid if VPN was started with 'nup')
+                Example, run 'curl ipinfo.io' in 'office' VPN namespace:
+                  wgc exec office curl ipinfo.io
+
+Configuration:
+  <vpn> must match a file in \$WGC_CFGDIR (Default: /etc/wireguard).
+  Example: 'office' matches '/etc/wireguard/office.conf'.
+  Export WGC_CFGDIR to override the default configuration directory.
+
+Bash Completion:
+  To enable bash completion: wgc completion
+  Redo completion if WGC_CFGDIR is changed.
 EOF
 }
 
@@ -466,14 +483,14 @@ remove_openresolv() {
 list_config_files() {
   local f= g=
   echo -e "Looking in $CFGDIR\n"
-  printf "%-12s %-4s %-18s %-29s %s\n" Name Br. Address Endpoint AllowedIPs
-  printf "%-12s %-4s %-18s %-29s %s\n" ---- --- ------- -------- ----------
+  prc "+W%-12s %-4s %-18s %-29s %s+/\n" Name Br. Address Endpoint AllowedIPs
+  prc "+A%-12s %-4s %-18s %-29s %s+/\n" ---- --- ------- -------- ----------
   for f in "$CFGDIR"/*.conf; do
     g=${f##*/}; g=${g%.*}
     [[ $g =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
     parse_config_file "$g" bridges relax || continue
     (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
-    printf "%-12s %-4s %-18s %-29s %s\n" "$g" ${#WGC_BRIDGES[@]} "$Address" "$Endpoint" "$AllowedIPs"
+    prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#WGC_BRIDGES[@]} "$Address" "$Endpoint" "$AllowedIPs"
   done
 }
 
@@ -492,27 +509,28 @@ show_parsed_config_file() {
 show_config() {
   echo
   prc "+W%-20s%s+/\n" Key  Value
-  prc "%-20s%s\n"     ---- -----
+  prc "+A%-20s%s+/\n"     ---- -----
   local pub
   for k in Address DNS MTU ListenPort PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
     prc "+c%-20s+Y${!k:++/}%s+/" $k "${!k:-(missing)}"
-    if [[ $k ==  P*Key ]]; then
+    if [[ $k ==  P*Key && ${!k} ]]; then
       if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
-        [[ $k == PrivateKey ]] && prc "\n└── %-15s %s" "PUBLIC" "$pub"
+        [[ $k == PrivateKey ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
       else
-        prc +R%s+/ $' \u2717 Invalid'
+        prc " $W +R%s+/ " invalid
       fi
     fi
+    [[ $k == @(Address|PrivateKey|PublicKey|Endpoint|AllowedIPs) && ! ${!k} ]] && prc " $W +R%s+/ " required
     printf "\n"
   done
   if (( ${#WGC_BRIDGES[@]} > 0 )); then
     echo
     local bridge_data b_name b_ext b_int
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
-    prc "%-20s%s\n"      -----------------   ------------------
+    prc "+A%-20s%s+/\n"      -----------------   ------------------
     for bridge_data in "${WGC_BRIDGES[@]}"; do
       IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
-      prc "+y%-20s+/%s\n" "$b_name" "$b_ext -> $b_int"
+      prc "+y%-19s+/ %s +A%s+/ %s\n" "$b_name" "$b_ext" "->" "$b_int"
     done
   fi
   echo
@@ -732,7 +750,7 @@ is_valid_ident() {
 exec_in_namespace() {
   [[ $# -eq 0 ]] && { error "No command specified"; show_usage; exit 1; }
   is_connected || error "VPN $VPN is not connected. Start it first with: wgc nup $VPN" fatal
-  [[ $IN_NAMESPACE ]] || error "VPN $VPN is not in its own namespace. Just use plain command: $@" fatal
+  [[ $IN_NAMESPACE ]] || error "VPN $VPN is not in its own namespace. Just use plain command: $*" fatal
 
   if [[ $(</proc/$PPID/comm) == sudo ]]; then
     # wgc auto-elevated or executed with sudo.
@@ -862,7 +880,7 @@ _wgc_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
   # Main commands
-  commands="conf parse up upd nup down state active list exec"
+  commands="conf parse up upd nup down state active list exec req"
 
   # Complete the first arg with main commands
   if [[ $COMP_CWORD -eq 1 ]]; then
@@ -1144,8 +1162,8 @@ configure_vpn_in_namespace() {
     else
 
       echo "Starting Port Forwarding Bridges:"
-      printf "%-20s %s\n" "Bridge" "ExtPort -> IntPort"
-      printf "%-20s %s\n" "------" "------------------"
+      prc "+W%-20s %s+/\n" "Bridge" "ExtPort -> IntPort"
+      prc "+A%-20s %s+/\n" "------" "------------------"
 
       local netns_path
       for netns_path in /run/netns/$NAMESPACE /var/run/netns/$NAMESPACE ""; do
@@ -1165,7 +1183,7 @@ configure_vpn_in_namespace() {
           continue
         fi
 
-        printf "%-20s %s\n" "$b_name" "$b_ext -> $b_int"
+        prc "+y%-20s +G%-7s +A%-2s +c%s+/\n" "$b_name" "$b_ext" "->" "$b_int"
 
         if [[ $PROXYD_BIN ]]; then # use systemd-socket-proxyd
           # 1. Start Internal Connector
@@ -1215,6 +1233,7 @@ configure_vpn_in_namespace() {
 }
 
 configure_vpn_plain() {
+  local k= q=
 
   # Configure interface $DEV
   ip addr add "$Address" dev $DEV || error "Failed to configure address '$Address' for interface '$DEV'" fatal
@@ -1223,19 +1242,17 @@ configure_vpn_plain() {
   }
   ip link set $DEV up || error "Failed to bring up interface '$DEV' with address '$Address'" fatal
 
+  if [[ $p_override_default_route ]]; then
   # Add a "split tunnel route" if wanted
-  if [[ $p_split_tunnel_route ]]; then
-    local -a q
-    q=($(ip route get "${Endpoint%%:*}" 2>/dev/null)) && [[ ${q[@]:0:3} ]] || \
-      error "Cannot find route to endpoint ${Endpoint%%:*}" fatal
-    # Add specific route to protect WireGuard UDP Stateless Tunnel to Endpoint
-    ip route replace ${q[@]:0:3} || error "Cannot set route to endpoint ${Endpoint%%:*}" fatal
-    ip route add 0/1 dev $DEV
-    ip route add 128/1 dev $DEV
+    set_split_route
+  else
+    for k in $AllowedIPs; do
+      [[ $k == "0.0.0.0/0" ]] && continue # Skip the catch-all route to avoid hijacking system-wide traffic
+      ip route add "$k" dev $DEV || error "Cannot add route to $k" fatal
+    done
   fi
 
   # Add default route valid only for source $Address (policy routing)
-  local k=
   for k in {1..251}; do
     [[ $(ip route show table $k 2>/dev/null) ]] || break
   done
@@ -1244,7 +1261,6 @@ configure_vpn_plain() {
   ip rule add from ${Address%/*} table $k
 
   # Configure DNS
-  local q=
   for k in $DNS; do
     if validate_ipv4 "$k"; then
       q+="nameserver $k"$'\n'
@@ -1255,11 +1271,23 @@ configure_vpn_plain() {
   [[ $q ]] && echo "$q" | resolvconf -a $DEV -x || \
     warn "DNS configuration failed.
           Ensure 'openresolv' is properly installed and configured."
+}
 
+set_split_route() {
+  local ep=${Endpoint%%:*} route
+  local -a route_args
+  validate_ipv4 "$ep" || read -r ep _ < <(getent ahostsv4 "$ep") || \
+    error "Cannot resolve Endpoint name '$ep'" fatal blameparent
+  route=$(ip -j route get "$ep" 2>/dev/null) || error "Cannot find route to Endpoint $ep" fatal blameparent
+  [[ $route =~ \"gateway\":\"([^\"]+)\" ]] && route_args+=(via "${BASH_REMATCH[1]}")
+  [[ $route =~ \"dev\":\"([^\"]+)\" ]] || error "Cannot determine output device for Endpoint $ep" fatal blameparent
+  route_args+=(dev "${BASH_REMATCH[1]}")
+  ip route replace "$ep" "${route_args[@]}" || error "Cannot set host route to Endpoint $ep" fatal blameparent
+  ip route add 0/1 dev $DEV; ip route add 128/1 dev $DEV
 }
 
 start_vpn() {
-  local p_split_tunnel_route= p_use_namespace=
+  local p_override_default_route= p_use_namespace=
   eval "$(get_params "$@")"
 
   is_connected && \
@@ -1323,8 +1351,8 @@ show_bridges() {
 
   if [[ $output ]]; then
     echo
-    printf "  %-18s %-19s %-8s %s\n" Bridge "ExtPort -> IntPort" Type Status
-    printf "  %-18s %-19s %-8s %s\n" ------ "------------------" ---- ------
+    prc "+W  %-18s %-19s %-8s %s+/\n" Bridge "ExtPort -> IntPort" Type Status
+    prc "+A  %-18s %-19s %-8s %s+/\n" ------ "------------------" ---- ------
 
     # Load all info in hash maps for instant lookup
     local -A u_active u_desc
@@ -1365,7 +1393,7 @@ show_bridges() {
           local int_status="${u_active[$int_unit]:-missing}"
           [[ $int_status != active ]] && status_str+=" / Int: $X $int_status"
 
-          printf "  %-18s %-7s %-11s %-8s %s\n" "$name" "$p_ext" "-> $p_int" "$tool" "$status_str"
+          prc "+y  %-18s+/ +G%-7s +A%-2s +c%-8s+/ %-8s %s\n" "$name" "$p_ext" "->" "$p_int" "$tool" "$status_str"
         fi
       fi
     done | sort # hash map order is undefined
@@ -1434,8 +1462,8 @@ show_state() {
 }
 
 validate_vpn_name() {
-  [[ $VPN =~ ^[a-zA-Z0-9_-]+$ ]] || \
-    error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore" fatal blameparent
+  [[ $VPN =~ ^[a-zA-Z0-9_-]{1,11}$ ]] || \
+    error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max lenght is 11." fatal blameparent
 }
 
 # -----------------------------------------------------------------------------
