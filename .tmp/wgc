@@ -510,9 +510,11 @@ show_config() {
   echo
   prc "+W%-20s%s+/\n" Key  Value
   prc "+A%-20s%s+/\n"     ---- -----
-  local pub
+  local pub val
   for k in Address DNS MTU ListenPort PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
-    prc "+c%-20s+Y${!k:++/}%s+/" $k "${!k:-(missing)}"
+    val=${!k:-(missing)}
+    [[ $k == PrivateKey && ${!k} ]] && val="<HIDDEN>"
+    prc "+c%-20s+Y${!k:++/}%s+/" $k "$val"
     if [[ $k ==  P*Key && ${!k} ]]; then
       if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
         [[ $k == PrivateKey ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
@@ -664,7 +666,9 @@ extract_all_ipv4() {
   local -n _out=$3
   local _regex='([0-9]{1,3}\.){3}[0-9]{1,3}'
   [[ "$_in" == cidr* ]] && _regex+='(/[0-9]+)?'
+  HAS_DEFAULT_ROUTE=
   while [[ $_in =~ $_regex ]]; do
+    [[ ${BASH_REMATCH[0]} == "0.0.0.0/0" ]] && HAS_DEFAULT_ROUTE=1
     _out+="$_sep${BASH_REMATCH[0]}"
     # Remove found match and go on
     _in=${_in#*"${BASH_REMATCH[0]}"}
@@ -1077,13 +1081,13 @@ clean_vpn() {
     [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
       ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
     # Remove route protecting Wireguard endpoint
-    local ep=
-    ep=($(wg show $DEV endpoints||true)) && {
-      [[ $ep ]] && {
+    local -a ep=()
+    ep=($(wg show $DEV endpoints)) && {
+      [[ ${ep[1]:-} ]] && {
         ep=${ep[1]%%:*}
         ip route del $ep &>/dev/null || true
       }
-    }
+    } || true
     # DNS restore: remove configuration associated with $DEV
     # If openresolv is missing or fails, proceed anyway
     resolvconf -d "$DEV" &>/dev/null || true
@@ -1223,7 +1227,8 @@ configure_vpn_in_namespace() {
         done
         if ((retries < 0)); then
           local status=$(systemctl is-active "$unit_to_check" 2>/dev/null)
-          warn "Bridge '$b_name' failed to start (status: ${status:-unknown}). Check logs: journalctl -u $unit_to_check"
+          warn "Bridge '$b_name' failed to start (status: ${status:-unknown}).
+                Check logs: journalctl -u $unit_to_check"
         fi
 
       done
@@ -1297,6 +1302,7 @@ start_vpn() {
   [[ $p_use_namespace ]] || check_openresolv
 
   # get parameters and forwarding bridges from config file named $VPN
+  local HAS_DEFAULT_ROUTE=
   parse_config_file $VPN ${p_use_namespace:+bridges}
 
   push_cleanup clean_vpn
@@ -1308,17 +1314,16 @@ start_vpn() {
   # Notice: this was tested against possible attack vectors, do not modify the general approach!
   local wgcmd='wg set $DEV'
   [[ $ListenPort ]] && wgcmd+=' listen-port "$ListenPort"'
-  wgcmd+=' private-key <(echo "$PrivateKey")'
+  wgcmd+=' private-key <(printf %s "$PrivateKey")'
   wgcmd+=' peer "$PublicKey"'
   wgcmd+=' allowed-ips "$AllowedIPs"'
   wgcmd+=' endpoint "$Endpoint"'
-  [[ $PresharedKey ]] && wgcmd+=' preshared-key <(echo "$PresharedKey")'
+  [[ $PresharedKey ]] && wgcmd+=' preshared-key <(printf %s "$PresharedKey")'
   [[ $PersistentKeepalive ]] && wgcmd+=' persistent-keepalive "$PersistentKeepalive"'
-  eval $wgcmd || {
-    error "Failed to configure WireGuard interface '$DEV' using command:"
-    wgcmd=${wgcmd/\$PrivateKey/<HIDDEN>}
-    eval $'cat <<EOF\n'$wgcmd$'\nEOF'
-    error " " fatal
+  eval "$wgcmd" || {
+    eval $'read -r -d "" wgcmd <<EOF\n'"${wgcmd/\$PrivateKey/<HIDDEN>}"$'\nEOF' || true
+    error "Failed to configure WireGuard interface '$DEV' using command:
+           $wgcmd" fatal
   }
 
   if [[ $p_use_namespace ]]; then
@@ -1330,7 +1335,6 @@ start_vpn() {
   pop_cleanup clean_vpn
 
   show_state
-
 }
 
 get_ns_pids() {
