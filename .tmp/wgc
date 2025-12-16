@@ -72,12 +72,12 @@ doit() {
 
   local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
   local CFGDIR; set_cfgdir; readonly CFGDIR
-  local IS_CONNECTED HAS_NAMESPACE IN_NAMESPACE IS_WGC
-  local Address PrivateKey PublicKey Endpoint AllowedIPs DNS MTU ListenPort PersistentKeepalive PresharedKey
+  local HAS_NAMESPACE IN_NAMESPACE
+  local Address PrivateKey PublicKey Endpoint AllowedIPs DNS MTU ListenPort PersistentKeepalive PresharedKey FwMark
   local -a WGC_BRIDGES
 
   case "$CMD" in
-    up|upd|n|nu|nup|d|do|dow|down|s|st|sta|stat|state|e|ex|exe|exec)
+    u|up|f|fu|fup|x|xu|xup|n|nu|nup|d|do|dow|down|s|st|sta|stat|state|e|ex|exe|exec)
       validate_vpn_name
       local ns=$(ip netns identify) || true
       [[ $ns ]] && error "Usage of wgc is not supported inside a network namespace ($ns)" fatal
@@ -94,14 +94,17 @@ doit() {
     p|pa|par|pars|parse)
       show_parsed_config_file
       ;;
-    up)
+    u|up)
       start_vpn
       ;;
-    upd)
-      start_vpn override_default_route
+    f|fu|fup)
+      start_vpn
+      ;;
+    x|xu|xup)
+      start_vpn
       ;;
     n|nu|nup)
-      start_vpn use_namespace
+      start_vpn nup
       ;;
     d|do|dow|down)
       stop_vpn ${3:-} # can be "force"
@@ -155,12 +158,23 @@ Usage:
   wgc exec <vpn> <command>
 
 Core Commands:
-  up <vpn>    - Start VPN in Split Tunnel mode.
-                (Uses AllowedIPs, but ignores 0.0.0.0/0 to keep default gateway)
-  upd <vpn>   - Start VPN in Full Tunnel mode overriding default gateway.
-                (Forces all traffic through VPN via override routes 0/1, 128/1)
-  nup <vpn>   - Start VPN in a dedicated Network Namespace (isolated stack).
-  down <vpn>  - Stop the VPN and clean up routes.
+  up <vpn>   - Start VPN in Standard mode.
+               Adds routes defined in AllowedIPs, applying special handling
+               for 0.0.0.0/0 to prevent loops.  Effect: Automatically handles
+               Split Tunnel or Full Tunnel based on configuration.
+  fup <vpn>  - Start VPN in Full Tunnel mode (Redirect All Traffic).
+               Ignores AllowedIPs routing logic and directs ALL traffic through
+               the tunnel. Useful for untrusted networks/public Wi-Fi.
+  xup <vpn>  - Start VPN in Bind-Only mode.
+               VPN is accessible, but no traffic is routed automatically because
+               system routing tables are not changed.  Traffic enters the tunnel
+               if and only if it is explicitly bound to the VPN interface or its
+               IP address.
+  nup <vpn>  - Start VPN in a dedicated Network Namespace (isolated stack)
+               named wgc_<vpn>.
+               ALL traffic is directed through VPN tunnel via default route.
+               Applications must be launched via 'wgc exec'.
+  down <vpn> - Stop the VPN and clean up routes.
 
 Inspection & Utils:
   state <vpn> - Show detailed state of a specific VPN.
@@ -171,10 +185,10 @@ Inspection & Utils:
   req         - Verify that required dependencies are installed.
 
 Execution:
-  exec <vpn>  - Run a command inside the VPN Network Namespace.
-                (Only valid if VPN was started with 'nup')
-                Example, run 'curl ipinfo.io' in 'office' VPN namespace:
-                  wgc exec office curl ipinfo.io
+  exec <vpn> - Run a command inside the VPN Network Namespace.
+               (Only valid if VPN was started with 'nup')
+               Example, run 'curl ipinfo.io' in 'office' VPN namespace:
+                 wgc exec office curl ipinfo.io
 
 Configuration:
   <vpn> must match a file in \$WGC_CFGDIR (Default: /etc/wireguard).
@@ -511,7 +525,7 @@ show_config() {
   prc "+W%-20s%s+/\n" Key  Value
   prc "+A%-20s%s+/\n"     ---- -----
   local pub val
-  for k in Address DNS MTU ListenPort PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
+  for k in Address DNS MTU ListenPort FwMark PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
     val=${!k:-(missing)}
     [[ $k == PrivateKey && ${!k} ]] && val="<HIDDEN>"
     prc "+c%-20s+Y${!k:++/}%s+/" $k "$val"
@@ -554,7 +568,7 @@ parse_config_file() {
   [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
   [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
   local line= n=0 s=0 section= key= value= ISSUES= BADSECTION=BADSECTION
-  Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= DNS= MTU= ListenPort= PersistentKeepalive= PresharedKey=
+  Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= DNS= MTU= ListenPort= FwMark= PersistentKeepalive= PresharedKey=
   WGC_BRIDGES=()
   local -A USED_BRPORTS=() USED_BRNAMES=()
   while read -r line || [[ $line ]]; do # also read last line if \n is missing
@@ -603,6 +617,7 @@ process_config_line() {
         MTU) MTU=$value ;;
         PrivateKey) PrivateKey=$value ;;
         ListenPort) ListenPort=$value ;;
+        FwMark) FwMark=$value ;;
         *) ISSUES+=$'\n'"Unknown key '$key' in section '$section' at line $n" ;;
       esac
       ;;
@@ -617,7 +632,7 @@ process_config_line() {
       esac
       ;;
     "[WGC-Bridges]")
-      [[ $p_bridges ]] || return 0
+      [[ $p_bridges ]] || { BADSECTION=$section; return 0; }
       # Sintax: <bridgename> = <externalport>-<internalport>
       # Example: qBittorrent = 8765-8765
       if [[ ! $key =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -666,9 +681,7 @@ extract_all_ipv4() {
   local -n _out=$3
   local _regex='([0-9]{1,3}\.){3}[0-9]{1,3}'
   [[ "$_in" == cidr* ]] && _regex+='(/[0-9]+)?'
-  HAS_DEFAULT_ROUTE=
   while [[ $_in =~ $_regex ]]; do
-    [[ ${BASH_REMATCH[0]} == "0.0.0.0/0" ]] && HAS_DEFAULT_ROUTE=1
     _out+="$_sep${BASH_REMATCH[0]}"
     # Remove found match and go on
     _in=${_in#*"${BASH_REMATCH[0]}"}
@@ -681,16 +694,15 @@ has_namespace() {
 }
 
 is_connected() {
-  IS_CONNECTED= HAS_NAMESPACE= IN_NAMESPACE=
+  HAS_NAMESPACE= IN_NAMESPACE=
 
   has_namespace && HAS_NAMESPACE=$NAMESPACE
   if ip -br link show $DEV &>/dev/null; then
-    IS_CONNECTED=default
     return 0
   fi
   [[ $HAS_NAMESPACE ]] || return 1
   ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null || return 1
-  IS_CONNECTED=$NAMESPACE; IN_NAMESPACE=$NAMESPACE
+  IN_NAMESPACE=$NAMESPACE
   return 0
 }
 
@@ -884,7 +896,7 @@ _wgc_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
   # Main commands
-  commands="conf parse up upd nup down state active list exec req"
+  commands="conf parse up fup xup nup down state active list exec req"
 
   # Complete the first arg with main commands
   if [[ $COMP_CWORD -eq 1 ]]; then
@@ -895,7 +907,7 @@ _wgc_completion() {
   # Complete the second arg depending on command
   if [[ $COMP_CWORD -eq 2 ]]; then
     case "$prev" in
-      up|upd|n|nu|nup|c|co|con|conf|p|pa|par|pars|parse)
+      u|up|f|fu|fup|x|xu|xup|n|nu|nup|c|co|con|conf|p|pa|par|pars|parse)
         # VPN config file list
         local v
         local modtime=$(stat -c %y "${WGC_CFGDIR:-/etc/wireguard}" 2>/dev/null)
@@ -1065,36 +1077,31 @@ clean_vpn() {
 
   fi
 
-  is_connected || true # Set IS_CONNECTED HAS_NAMESPACE IN_NAMESPACE
+  # DNS restore: remove configuration associated with $DEV
+  # If openresolv is missing or fails, proceed anyway
+  resolvconf -d $DEV &>/dev/null || true
+  rm -rf /etc/netns/$NAMESPACE &>/dev/null || true
 
-  [[ $IN_NAMESPACE ]] && ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
+  if is_connected; then # Set HAS_NAMESPACE IN_NAMESPACE
+    # Remove route protecting Wireguard endpoint
+    del_endpoint_host_route
+    if [[ $IN_NAMESPACE ]]; then
+      # Remove interface and related things
+      ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
+    else
+      # Remove source routing rule
+      del_source_routing
+      # Remove interface and related things
+      ip link del $DEV &>/dev/null || true
+    fi
+  fi
 
   if [[ $HAS_NAMESPACE ]]; then
     # Remove namespace
     # Note: Processes that were in the deleted namespace lose network connectivity
     # but continue running.
     ip netns del $NAMESPACE &>/dev/null || true
-    rm -rf /etc/netns/$NAMESPACE &>/dev/null || true
   fi
-
-  if [[ $IS_CONNECTED == default ]]; then
-    [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
-      ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
-    # Remove route protecting Wireguard endpoint
-    local -a ep=()
-    ep=($(wg show $DEV endpoints)) && {
-      [[ ${ep[1]:-} ]] && {
-        ep=${ep[1]%%:*}
-        ip route del $ep &>/dev/null || true
-      }
-    } || true
-    # DNS restore: remove configuration associated with $DEV
-    # If openresolv is missing or fails, proceed anyway
-    resolvconf -d "$DEV" &>/dev/null || true
-    # Remove interface and related things
-    ip link del $DEV &>/dev/null || true
-  fi
-
 }
 
 start_transient_service() {
@@ -1238,8 +1245,6 @@ configure_vpn_in_namespace() {
 }
 
 configure_vpn_plain() {
-  local k= q=
-
   # Configure interface $DEV
   ip addr add "$Address" dev $DEV || error "Failed to configure address '$Address' for interface '$DEV'" fatal
   [[ $MTU ]] && {
@@ -1247,38 +1252,49 @@ configure_vpn_plain() {
   }
   ip link set $DEV up || error "Failed to bring up interface '$DEV' with address '$Address'" fatal
 
-  if [[ $p_override_default_route ]]; then
-  # Add a "split tunnel route" if wanted
-    set_split_route
-  else
-    for k in $AllowedIPs; do
-      [[ $k == "0.0.0.0/0" ]] && continue # Skip the catch-all route to avoid hijacking system-wide traffic
-      ip route add "$k" dev $DEV || error "Cannot add route to $k" fatal
-    done
+  # Always add default route valid only for source $Address (source policy routing)
+  set_source_routing
+
+  if [[ $CMD != xup* ]]; then
+    if [[ $CMD == fup ]]; then
+      set_override_default_route
+    else
+      local set_override=
+      for k in $AllowedIPs; do
+        [[ $k == "0.0.0.0/0" ]] && { set_override=1; continue; }
+        ip route add "$k" dev $DEV || error "Cannot add route to $k" fatal
+      done
+      [[ $set_override ]] && set_override_default_route
+    fi
   fi
 
-  # Add default route valid only for source $Address (policy routing)
-  for k in {1..251}; do
-    [[ $(ip route show table $k 2>/dev/null) ]] || break
-  done
-  ((k >= 251)) && error "Cannot find an empty routing table in the range 1..250" fatal
-  ip route add default dev $DEV table $k
-  ip rule add from ${Address%/*} table $k
-
-  # Configure DNS
-  for k in $DNS; do
-    if validate_ipv4 "$k"; then
-      q+="nameserver $k"$'\n'
+  if [[ $CMD != xup && $DNS ]]; then
+    # Configure DNS
+    local k= q=
+    for k in $DNS; do
+      if validate_ipv4 "$k"; then
+        q+="nameserver $k"$'\n'
+        [[ $CMD == xupd ]] && ip route add "$k" dev "$DEV" 2>/dev/null || true
+      else
+        warn "Skipping invalid DNS server '$k'"
+      fi
+    done
+    if [[ $q ]]; then
+      echo "$q" | resolvconf -a $DEV -m 0 -x || \
+        warn "DNS configuration failed.
+              Ensure 'openresolv' is properly installed and configured."
     else
-      warn "Skipping invalid DNS server '$k'"
+      warn "Could not find any valid ip address in DNS parameter"
     fi
-  done
-  [[ $q ]] && echo "$q" | resolvconf -a $DEV -x || \
-    warn "DNS configuration failed.
-          Ensure 'openresolv' is properly installed and configured."
+  fi
 }
 
-set_split_route() {
+set_override_default_route() {
+  ip route add 0/1 dev $DEV || error "Cannot set default route override 0.0.0.0/1" fatal blameparent
+  ip route add 128/1 dev $DEV || error "Cannot set default route override 128.0.0.0/1" fatal blameparent
+}
+
+set_endpoint_host_route() {
   local ep=${Endpoint%%:*} route
   local -a route_args
   validate_ipv4 "$ep" || read -r ep _ < <(getent ahostsv4 "$ep") || \
@@ -1287,36 +1303,65 @@ set_split_route() {
   [[ $route =~ \"gateway\":\"([^\"]+)\" ]] && route_args+=(via "${BASH_REMATCH[1]}")
   [[ $route =~ \"dev\":\"([^\"]+)\" ]] || error "Cannot determine output device for Endpoint $ep" fatal blameparent
   route_args+=(dev "${BASH_REMATCH[1]}")
-  ip route replace "$ep" "${route_args[@]}" || error "Cannot set host route to Endpoint $ep" fatal blameparent
-  ip route add 0/1 dev $DEV; ip route add 128/1 dev $DEV
+  ip route add "$ep" "${route_args[@]}" || error "Cannot set host route to Endpoint $ep" fatal blameparent
+}
+
+del_endpoint_host_route() {
+  local nscmd=
+  [[ $HAS_NAMESPACE ]] && nscmd="ip netns exec $NAMESPACE"
+  local -a ep=()
+  ep=($($nscmd wg show $DEV endpoints)) && {
+    [[ ${ep[1]:-} ]] && {
+      ep=${ep[1]%%:*}
+      ip route del $ep &>/dev/null || true
+    }
+  } || true
+}
+
+set_source_routing() {
+  local -i t
+  for ((t=51820; t<65536; t++))
+    [[ $(ip route show table $t 2>/dev/null) ]] || break
+  done
+  ((t > 65535)) && error "Cannot find an empty routing table in the range 51820..65535" fatal
+  ip route add default dev $DEV table $t
+  ip rule add from ${Address%/*} table $t
+}
+
+del_source_routing() {
+  [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
+    ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
 }
 
 start_vpn() {
-  local p_override_default_route= p_use_namespace=
-  eval "$(get_params "$@")"
-
   is_connected && \
     error "$VPN is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
            To reconnect, first stop it: wgc down $VPN" fatal
 
-  [[ $p_use_namespace ]] || check_openresolv
+  [[ $CMD == nup ]] || check_openresolv
 
   # get parameters and forwarding bridges from config file named $VPN
-  local HAS_DEFAULT_ROUTE=
-  parse_config_file $VPN ${p_use_namespace:+bridges}
+  parse_config_file $VPN ${p_nup:+bridges}
 
   push_cleanup clean_vpn
 
   # Create WireGuard interface
   ip link add dev $DEV type wireguard || error "Failed to create WireGuard interface '$DEV'" fatal
 
+  # Override AllowedIPs for Full Tunnel mode (fup) or Bind-Only modes (xup/xupd).
+  # Instructs WireGuard to allow all traffic in and out of the tunnel.
+  if [[ $CMD == @(fup|xup*) ]]; then
+    AllowedIPs="0.0.0.0/0" # add " ::/0" if IPv6 supported
+  fi
+
   # Configure WireGuard
   # Notice: this was tested against possible attack vectors, do not modify the general approach!
   local wgcmd='wg set $DEV'
   [[ $ListenPort ]] && wgcmd+=' listen-port "$ListenPort"'
+  [[ $FwMark ]] && wgcmd+=' fwmark "$FwMark"'
   wgcmd+=' private-key <(printf %s "$PrivateKey")'
   wgcmd+=' peer "$PublicKey"'
-  wgcmd+=' allowed-ips "$AllowedIPs"'
+  wgcmd+=' allowed-ips "${AllowedIPs// /,}"'
   wgcmd+=' endpoint "$Endpoint"'
   [[ $PresharedKey ]] && wgcmd+=' preshared-key <(printf %s "$PresharedKey")'
   [[ $PersistentKeepalive ]] && wgcmd+=' persistent-keepalive "$PersistentKeepalive"'
@@ -1326,7 +1371,13 @@ start_vpn() {
            $wgcmd" fatal
   }
 
-  if [[ $p_use_namespace ]]; then
+  # Protect endpoint reachability against:
+  # - override routes 0/1 and 128/1 possibly added in configure_vpn_plain()
+  # - bad routes added in configure_vpn_plain() due to AllowedIPs
+  # - bad routes added outside wgc after VPN start
+  set_endpoint_host_route
+
+  if [[ $CMD == nup ]]; then
     configure_vpn_in_namespace
   else
     configure_vpn_plain
