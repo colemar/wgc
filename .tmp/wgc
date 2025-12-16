@@ -77,7 +77,7 @@ doit() {
   local -a WGC_BRIDGES
 
   case "$CMD" in
-    u|up|f|fu|fup|x|xu|xup|n|nu|nup|d|do|dow|down|s|st|sta|stat|state|e|ex|exe|exec)
+    u|up|f|fu|fup|bup|bupd|n|nu|nup|d|do|dow|down|s|st|sta|stat|state|e|ex|exe|exec)
       validate_vpn_name
       local ns=$(ip netns identify) || true
       [[ $ns ]] && error "Usage of wgc is not supported inside a network namespace ($ns)" fatal
@@ -88,23 +88,8 @@ doit() {
   esac
 
   case "$CMD" in
-    c|co|con|conf)
-      show_config_file
-      ;;
-    p|pa|par|pars|parse)
-      show_parsed_config_file
-      ;;
-    u|up)
+    u|up|f|fu|fup|bup?(d)|nup)
       start_vpn
-      ;;
-    f|fu|fup)
-      start_vpn
-      ;;
-    x|xu|xup)
-      start_vpn
-      ;;
-    n|nu|nup)
-      start_vpn nup
       ;;
     d|do|dow|down)
       stop_vpn ${3:-} # can be "force"
@@ -112,18 +97,24 @@ doit() {
     s|st|sta|stat|state)
       show_state bridges
       ;;
-    e|ex|exe|exec)
-      shift 2
-      exec_in_namespace "$@"
-      ;;
     a|ac|act|acti|activ|active)
       show_active_vpns
       ;;
     l|li|lis|list)
       list_config_files
       ;;
+    c|co|con|conf)
+      show_config_file
+      ;;
+    p|pa|par|pars|parse)
+      show_parsed_config_file
+      ;;
     r|re|req)
       check_dependencies
+      ;;
+    e|ex|exe|exec)
+      shift 2
+      exec_in_namespace "$@"
       ;;
     completion)
       enable_completion
@@ -161,15 +152,20 @@ Core Commands:
   up <vpn>   - Start VPN in Standard mode.
                Adds routes defined in AllowedIPs, applying special handling
                for 0.0.0.0/0 to prevent loops.  Effect: Automatically handles
-               Split Tunnel or Full Tunnel based on configuration.
+               Split Tunnel or Full Tunnel based on configuration file.
   fup <vpn>  - Start VPN in Full Tunnel mode (Redirect All Traffic).
                Ignores AllowedIPs routing logic and directs ALL traffic through
-               the tunnel. Useful for untrusted networks/public Wi-Fi.
-  xup <vpn>  - Start VPN in Bind-Only mode.
+               the VPN tunnel. Useful for untrusted networks/public Wi-Fi.
+  bup <vpn>  - Start VPN in Bind-Only mode.
                VPN is accessible, but no traffic is routed automatically because
-               system routing tables are not changed.  Traffic enters the tunnel
-               if and only if it is explicitly bound to the VPN interface or its
-               IP address.
+               neither system routing tables nor DNS settings are modified.
+               Traffic enters the tunnel if and only if it is explicitly bound
+               to the VPN interface or its IP address.
+  bupd <vpn> - Start VPN in Bind-Only mode with DNS.
+               Just like bup, but enforces VPN DNS settings system-wide.
+               Routes are added only for the nameservers to ensure reachability.
+               Data traffic still requires explicit binding, but DNS resolution
+               is performed via the VPN tunnel for the entire system.
   nup <vpn>  - Start VPN in a dedicated Network Namespace (isolated stack)
                named wgc_<vpn>.
                ALL traffic is directed through VPN tunnel via default route.
@@ -335,793 +331,146 @@ set_cfgdir() {
   return 0
 }
 
-check_dependencies() {
-  local missing=()
-  for cmd in tput ip wg grep resolvconf mkdir rm ps sleep find curl sed setpriv socat; do
-    command -v $cmd >/dev/null || missing+=($cmd)
-  done
-  if (( ${#missing[@]} > 0 )); then
-    error "Missing required commands: ${missing[*]}
-           Install with:
-           apt install wireguard-tools iproute2 grep sed coreutils \\
-           procps findutils openresolv util-linux ncurses-bin" fatal blameparent
+start_vpn() {
+  is_connected && \
+    error "$VPN is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
+           To reconnect, first stop it: wgc down $VPN" fatal
+
+  [[ $CMD == nup ]] || check_openresolv
+
+  # get parameters and forwarding bridges from config file named $VPN
+  parse_config_file $VPN ${p_nup:+bridges}
+
+  push_cleanup clean_vpn
+
+  # Create WireGuard interface
+  ip link add dev $DEV type wireguard || error "Failed to create WireGuard interface '$DEV'" fatal
+
+  # Override AllowedIPs for Full Tunnel (fup), Bind-Only (bup/bupd) and Namespace (nup) modes.
+  # Instructs WireGuard to allow all traffic in and out of the tunnel.
+  if [[ $CMD == @(fup|bup?(d)|nup) ]]; then
+    AllowedIPs="0.0.0.0/0" # add " ::/0" if IPv6 supported
   fi
-  echo "$Y All required commands are available."
-}
 
-has_openresolv() {
-  [[ $(resolvconf -h 2>/dev/null) =~ -x[[:blank:]][[:blank:].A-Za-z]*[[:blank:]]exclusive ]]
-}
-
-check_openresolv() {
-  if ! has_openresolv; then
-    local tailmsg='Please run: apt-get install openresolv'
-    [[ -d /run/systemd/resolve ]] && tailmsg="This system has systemd-resolved.
-      To bypass debian package conflict with openresolv run 'wgc openresolv' instead of 'apt-get install openresolv'.
-      To remove openresolv installed by wgc run 'wgc remopenresolv'."
-    error "Your version of 'resolvconf' does not support exclusive mode (-x).
-           $tailmsg" fatal blameparent
-  fi
-}
-
-install_forced_openresolv() {
-  has_openresolv && error "Openresolv is already installed ('resolvconf' supports exclusive mode -x)." fatal
-
-  [[ -L /usr/sbin/resolvconf ]] ||
-    error "Systemd-resolved symlink wrapper for 'resolvconf' NOT detected. Standard installation is possible.
-           Please install 'openresolv' using: sudo apt-get install openresolv" fatal
-
-  echo "Forcing openresolv installation..."
-
-  dpkg-divert --list | grep "/usr/sbin/resolvconf" > /dev/null || {
-    echo "Diversion of resolvconf binary..."
-    dpkg-divert --divert /usr/sbin/resolvconf.systemd --rename --add /usr/sbin/resolvconf
+  # Configure WireGuard
+  # Notice: this was tested against possible attack vectors, do not modify the general approach!
+  local wgcmd='wg set $DEV'
+  [[ $ListenPort ]] && wgcmd+=' listen-port "$ListenPort"'
+  [[ $FwMark ]] && wgcmd+=' fwmark "$FwMark"'
+  wgcmd+=' private-key <(printf %s "$PrivateKey")'
+  wgcmd+=' peer "$PublicKey"'
+  wgcmd+=' allowed-ips "${AllowedIPs// /,}"'
+  wgcmd+=' endpoint "$Endpoint"'
+  [[ $PresharedKey ]] && wgcmd+=' preshared-key <(printf %s "$PresharedKey")'
+  [[ $PersistentKeepalive ]] && wgcmd+=' persistent-keepalive "$PersistentKeepalive"'
+  eval "$wgcmd" || {
+    eval $'read -r -d "" wgcmd <<EOF\n'"${wgcmd/\$PrivateKey/<HIDDEN>}"$'\nEOF' || true
+    error "Failed to configure WireGuard interface '$DEV' using command:
+           $wgcmd" fatal
   }
 
-  local TEMP_DIR=$(mktemp -d)
-  mkdir -p "$TEMP_DIR"
-  cd "$TEMP_DIR" || return 1
+  # Protect endpoint reachability against:
+  # - override routes 0/1 and 128/1 possibly added in configure_vpn_plain()
+  # - bad routes added in configure_vpn_plain() due to AllowedIPs
+  # - bad routes added outside wgc after VPN start
+  set_endpoint_host_route
 
-  apt-get download openresolv 2>/dev/null
-  local DEB_FILE=$(find . -name "openresolv*.deb" | head -n 1)
-  if [[ $DEB_FILE ]]; then
-    echo "Download via APT successful."
+  if [[ $CMD == nup ]]; then
+    configure_vpn_in_namespace
   else
-    echo "APT download failed (package 'openresolv' likely missing)."
-    echo "Attempting download via Debian Unstable Packages index..."
-    local IDX_URL="https://ftp.debian.org/debian/dists/stable/main/binary-all/Packages.gz"
-    local REL_PATH=$(curl -s "$IDX_URL" | \
-          zgrep -m 1 "^Filename: .*openresolv_.*_all.deb" | cut -d ' ' -f 2)
-    if [[ -z $REL_PATH ]]; then
-      echo "Error: Could not find openresolv in Debian index."
-      echo "Tried searching: $IDX_URL"
-      echo "This may indicate the package has been removed or renamed."
-      cd .. && rm -rf "$TEMP_DIR"
-      return 1
+    configure_vpn_plain
+  fi
+
+  pop_cleanup clean_vpn
+
+  show_state
+}
+
+configure_vpn_plain() {
+  # Configure interface $DEV
+  ip addr add "$Address" dev $DEV || error "Failed to configure address '$Address' for interface '$DEV'" fatal
+  [[ $MTU ]] && {
+    ip link set $DEV mtu $MTU || error "Failed to configure MTU '$MTU' for interface '$DEV'" fatal
+  }
+  ip link set $DEV up || error "Failed to bring up interface '$DEV' with address '$Address'" fatal
+
+  # Always add default route valid only for source $Address (source policy routing)
+  set_source_routing
+
+  if [[ $CMD == fup ]]; then
+    set_override_default_route
+  elsif [[ $CMD == up ]]; then
+    local set_override=
+    for k in $AllowedIPs; do
+      [[ $k == "0.0.0.0/0" ]] && { set_override=1; continue; }
+      ip route add "$k" dev $DEV || error "Cannot add route to $k" fatal
+    done
+    [[ $set_override ]] && set_override_default_route
+  fi
+
+  if [[ $CMD == @(up|fup|bupd) && $DNS ]]; then
+    # Configure DNS
+    local k= q=
+    for k in $DNS; do
+      if validate_ipv4 "$k"; then
+        q+="nameserver $k"$'\n'
+        [[ $CMD == bupd ]] && ip route add "$k" dev "$DEV" 2>/dev/null || true
+      else
+        warn "Skipping invalid DNS server '$k'"
+      fi
+    done
+    if [[ $q ]]; then
+      echo "$q" | resolvconf -a $DEV -m 0 -x || \
+        warn "DNS configuration failed.
+              Ensure 'openresolv' is properly installed and configured."
+    else
+      warn "Could not find any valid ip address in DNS parameter"
     fi
-    local FULL_URL="https://ftp.debian.org/debian/$REL_PATH"
-    DEB_FILE=$(basename "$REL_PATH")
-    echo "Detected version: $DEB_FILE"
-    wget -O "$DEB_FILE" "$FULL_URL" || {
-      echo "Download failed: $FULL_URL"
-      cd .. && rm -rf "$TEMP_DIR"
-      return 1
+  fi
+}
+
+set_override_default_route() {
+  ip route add 0/1 dev $DEV || error "Cannot set default route override 0.0.0.0/1" fatal blameparent
+  ip route add 128/1 dev $DEV || error "Cannot set default route override 128.0.0.0/1" fatal blameparent
+}
+
+set_endpoint_host_route() {
+  local ep=${Endpoint%%:*} route
+  local -a route_args
+  validate_ipv4 "$ep" || read -r ep _ < <(getent ahostsv4 "$ep") || \
+    error "Cannot resolve Endpoint name '$ep'" fatal blameparent
+  route=$(ip -j route get "$ep" 2>/dev/null) || error "Cannot find route to Endpoint $ep" fatal blameparent
+  [[ $route =~ \"gateway\":\"([^\"]+)\" ]] && route_args+=(via "${BASH_REMATCH[1]}")
+  [[ $route =~ \"dev\":\"([^\"]+)\" ]] || error "Cannot determine output device for Endpoint $ep" fatal blameparent
+  route_args+=(dev "${BASH_REMATCH[1]}")
+  ip route add "$ep" "${route_args[@]}" || error "Cannot set host route to Endpoint $ep" fatal blameparent
+}
+
+del_endpoint_host_route() {
+  local nscmd=
+  [[ $IN_NAMESPACE ]] && nscmd="ip netns exec $NAMESPACE"
+  local -a ep=()
+  ep=($($nscmd wg show $DEV endpoints)) && {
+    [[ ${ep[1]:-} ]] && {
+      ep=${ep[1]%%:*}
+      ip route del $ep &>/dev/null || true
     }
-  fi
-
-  echo "Creating file manifest..."
-  mkdir -p /etc/wwggcc
-
-  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tf - | grep -v '/$' | sed 's|^./|/|' > /etc/wwggcc/openresolv.files
-
-  echo "Extracting directly to system..."
-  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar --keep-directory-symlink --no-overwrite-dir -xC /
-
-  cd ..
-  rm -rf "$TEMP_DIR"
-
-  echo "Detecting DNS backend..."
-  if [[ -d /run/systemd/resolve ]]; then
-    echo "Systemd-resolved detected. Appending configuration."
-    if ! grep -q "name_servers=\"127.0.0.53\"" /etc/resolvconf.conf; then
-      {
-        echo ""
-        echo "# Added by wgc installer for systemd-resolved compatibility"
-        echo "name_servers=\"127.0.0.53\""
-        echo "resolv_conf_options=\"trust-ad\""
-      } >> /etc/resolvconf.conf
-    else
-      echo "Configuration already present. Skipping."
-    fi
-  else
-    echo "Systemd-resolved NOT detected. Leaving standard configuration."
-  fi
-
-  echo "Regenerating resolvconf..."
-  /sbin/resolvconf -u
-
-  if command -v mandb >/dev/null; then
-    echo "Updating the manual page index caches..."
-    mandb -pq
-  fi
-
-  echo "Openresolv forced successfully."
-  echo "Manifest saved to /etc/wwggcc/openresolv.files"
-  echo "To remove openresolv: wgc remopenresolv"
+  } || true
 }
 
-remove_openresolv() {
-  local MANIFEST=/etc/wwggcc/openresolv.files
-
-  echo "Removing openresolv..."
-
-  dpkg-divert --list | grep "/usr/sbin/resolvconf" > /dev/null ||
-    error "No package diversion found. Assuming standard APT management.
-           To uninstall 'openresolv', please use: sudo apt remove openresolv" fatal
-
-  echo "Removing diversion of resolvconf binary..."
-  rm -f /usr/sbin/resolvconf
-  dpkg-divert --rename --remove /usr/sbin/resolvconf
-
-  if [[ -f "$MANIFEST" ]]; then
-    echo "Deleting installed files..."
-    cat "$MANIFEST" | tr '\n' '\0' | xargs -0 rm -f
-    rm -f "$MANIFEST"
-  else
-    echo "Warning: Manifest $MANIFEST not found. Trying generic cleanup..."
-    rm -f /usr/sbin/resolvconf
-    rm -rf /usr/lib/resolvconf
-    rm -f /etc/resolvconf.conf
-  fi
-
-  rmdir /usr/lib/resolvconf 2>/dev/null || true
-
-  echo "Restoring systemd-resolved symlink /etc/resolv.conf..."
-  if [[ -f /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
-    rm -f /etc/resolv.conf
-    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-  fi
-
-  echo "Restoring systemd-resolved resolvconf symlink wrapper..."
-  rm -f /usr/sbin/resolvconf
-  ln -sf /usr/bin/resolvectl /usr/sbin/resolvconf
-
-  if command -v mandb >/dev/null; then
-    echo "Updating the manual page index caches..."
-    mandb -pq
-  fi
-
-  echo "Done. System returned to APT management."
-}
-
-list_config_files() {
-  local f= g=
-  echo -e "Looking in $CFGDIR\n"
-  prc "+W%-12s %-4s %-18s %-29s %s+/\n" Name Br. Address Endpoint AllowedIPs
-  prc "+A%-12s %-4s %-18s %-29s %s+/\n" ---- --- ------- -------- ----------
-  for f in "$CFGDIR"/*.conf; do
-    g=${f##*/}; g=${g%.*}
-    [[ $g =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-    parse_config_file "$g" bridges relax || continue
-    (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
-    prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#WGC_BRIDGES[@]} "$Address" "$Endpoint" "$AllowedIPs"
+set_source_routing() {
+  local -i t
+  for ((t=51820; t<65536; t++))
+    [[ $(ip route show table $t 2>/dev/null) ]] || break
   done
+  ((t > 65535)) && error "Cannot find an empty routing table in the range 51820..65535" fatal
+  ip route add default dev $DEV table $t
+  ip rule add from ${Address%/*} table $t
 }
 
-show_config_file() {
-  local -r config_file="$CFGDIR/$VPN.conf"
-  [[ -f $config_file ]] || error "Not a file: $config_file"
-  [[ -r $config_file ]] || error "Cannot read file: $config_file"
-  printf %s\\n "$(< $config_file)"
-}
-
-show_parsed_config_file() {
-  parse_config_file $VPN bridges report
-  show_config
-}
-
-show_config() {
-  echo
-  prc "+W%-20s%s+/\n" Key  Value
-  prc "+A%-20s%s+/\n"     ---- -----
-  local pub val
-  for k in Address DNS MTU ListenPort FwMark PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
-    val=${!k:-(missing)}
-    [[ $k == PrivateKey && ${!k} ]] && val="<HIDDEN>"
-    prc "+c%-20s+Y${!k:++/}%s+/" $k "$val"
-    if [[ $k ==  P*Key && ${!k} ]]; then
-      if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
-        [[ $k == PrivateKey ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
-      else
-        prc " $W +R%s+/ " invalid
-      fi
-    fi
-    [[ $k == @(Address|PrivateKey|PublicKey|Endpoint|AllowedIPs) && ! ${!k} ]] && prc " $W +R%s+/ " required
-    printf "\n"
-  done
-  if (( ${#WGC_BRIDGES[@]} > 0 )); then
-    echo
-    local bridge_data b_name b_ext b_int
-    prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
-    prc "+A%-20s%s+/\n"      -----------------   ------------------
-    for bridge_data in "${WGC_BRIDGES[@]}"; do
-      IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
-      prc "+y%-19s+/ %s +A%s+/ %s\n" "$b_name" "$b_ext" "->" "$b_int"
-    done
-  fi
-  echo
-}
-
-is_valid_port() {
-  local p=$1
-  [[ $p =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535))
-}
-
-parse_config_file() {
-  local -r config_file="$CFGDIR/$1.conf"
-  shift 1
-  local p_relax= p_bridges= p_report=
-  eval "$(get_params "$@")"
-
-  local fatal=fatal; [[ $p_relax ]] && fatal=
-
-  [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
-  [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
-  local line= n=0 s=0 section= key= value= ISSUES= BADSECTION=BADSECTION
-  Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= DNS= MTU= ListenPort= FwMark= PersistentKeepalive= PresharedKey=
-  WGC_BRIDGES=()
-  local -A USED_BRPORTS=() USED_BRNAMES=()
-  while read -r line || [[ $line ]]; do # also read last line if \n is missing
-      ((++n))
-      line=${line%%#*} # Remove comments
-      [[ ! $line =~ [^[:space:]] ]] && continue # Skip empty lines
-      if [[ $line =~ ^[[:space:]]*(\[[A-Za-z0-9_-]+\])[[:space:]]*$ ]]; then
-        section=${BASH_REMATCH[1]} # Track section
-        s=$n # remember section line number
-        continue
-      fi
-      # Skip lines in bad sections (even before all sections)
-      [[ $section == "$BADSECTION" ]] && continue
-      # Parse key=value with flexible spacing
-      if [[ $line =~ ^[[:space:]]*([A-Za-z0-9]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]]) ]]; then
-        key=${BASH_REMATCH[1]}   # key without spaces
-        value=${BASH_REMATCH[2]} # value trimmed
-      else # Not a key=value line
-        ISSUES+=$'\n'"Malformed line $n: ${line:0:50}$( ((${#line} > 50)) && echo ... || true )"
-        continue
-      fi
-      # Get values according to section/key
-      process_config_line $s $n "$key" "$value" "$section"
-  done < "$config_file"
-  if [[ ! $p_relax ]]; then
-    for n in Address PrivateKey PublicKey Endpoint AllowedIPs; do
-      [[ ${!n} ]] || \
-        if [[ $p_report ]]; then
-          ISSUES+=$'\n'"Missing required key '$n'"
-        else
-          error "Missing required key '$n' in file $config_file" fatal blameparent
-        fi
-    done
-    [[ $ISSUES ]] && warn "Issues in $config_file:$ISSUES" || true
-  fi
-}
-
-process_config_line() {
-  local s=$1 n=$2 key=$3 value=$4 section=$5
-
-  case "$section" in
-    "[Interface]")
-      case "$key" in
-        Address) extract_ipv4 "$value" Address ;;
-        DNS) extract_all_ipv4 "$value" ' ' DNS ;;
-        MTU) MTU=$value ;;
-        PrivateKey) PrivateKey=$value ;;
-        ListenPort) ListenPort=$value ;;
-        FwMark) FwMark=$value ;;
-        *) ISSUES+=$'\n'"Unknown key '$key' in section '$section' at line $n" ;;
-      esac
-      ;;
-    "[Peer]")
-      case "$key" in
-        AllowedIPs) extract_all_ipv4 "cidr$value" ',' AllowedIPs ;;
-        Endpoint) Endpoint=$value ;;
-        PersistentKeepalive) PersistentKeepalive=$value ;;
-        PresharedKey) PresharedKey=$value ;;
-        PublicKey) PublicKey=$value ;;
-        *) ISSUES+=$'\n'"Unknown key '$key' in section '$section' at line $n" ;;
-      esac
-      ;;
-    "[WGC-Bridges]")
-      [[ $p_bridges ]] || { BADSECTION=$section; return 0; }
-      # Sintax: <bridgename> = <externalport>-<internalport>
-      # Example: qBittorrent = 8765-8765
-      if [[ ! $key =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        ISSUES+=$'\n'"Invalid bridge name '$key' at line $n (chars allowed: A-Z, a-z, 0-9, _, -)"
-        return
-      fi
-      if [[ -v USED_BRNAMES[$key] ]]; then
-        ISSUES+=$'\n'"Duplicate bridge name '$key' at lines $n and ${USED_BRNAMES[$key]}"
-        return
-      fi
-      if [[ $value =~ ^([0-9]+)[[:space:]]*-[[:space:]]*([0-9]+)$ ]]; then
-        local ext_port="${BASH_REMATCH[1]}"
-        local int_port="${BASH_REMATCH[2]}"
-        if ! is_valid_port $ext_port || ! is_valid_port $int_port; then
-          ISSUES+=$'\n'"Invalid port at line $n (must be 1-65535): $value"
-          return
-        fi
-        if [[ -v USED_BRPORTS[$ext_port] ]]; then
-          ISSUES+=$'\n'"Duplicate external port $ext_port for bridge '$key' at line $n (already used by '${USED_BRPORTS[$ext_port]}')"
-          return
-        fi
-        USED_BRNAMES[$key]=$n
-        USED_BRPORTS[$ext_port]=$key
-        WGC_BRIDGES+=("$key:$ext_port:$int_port")
-      else
-        ISSUES+=$'\n'"Invalid bridge format '$value' at line $n. Use: external-internal (e.g., 4321-1234)"
-      fi
-      ;;
-    *)
-      BADSECTION=$section
-      ISSUES+=$'\n'"Unknown section '$section' at line $s"
-      ;;
-  esac
-}
-
-extract_ipv4() {
-  local _in=$1
-  local -n _out=$2
-  local _regex='([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?'
-  [[ $_in =~ $_regex ]] && _out="${BASH_REMATCH[0]}" || _out=
-}
-
-extract_all_ipv4() {
-  local _in=$1
-  local _sep=${2:- }
-  local -n _out=$3
-  local _regex='([0-9]{1,3}\.){3}[0-9]{1,3}'
-  [[ "$_in" == cidr* ]] && _regex+='(/[0-9]+)?'
-  while [[ $_in =~ $_regex ]]; do
-    _out+="$_sep${BASH_REMATCH[0]}"
-    # Remove found match and go on
-    _in=${_in#*"${BASH_REMATCH[0]}"}
-  done
-  _out=${_out#$_sep} # Remove initial separator if present
-}
-
-has_namespace() {
-  [[ -f /run/netns/$NAMESPACE || -f /var/run/netns/$NAMESPACE ]]
-}
-
-is_connected() {
-  HAS_NAMESPACE= IN_NAMESPACE=
-
-  has_namespace && HAS_NAMESPACE=$NAMESPACE
-  if ip -br link show $DEV &>/dev/null; then
-    return 0
-  fi
-  [[ $HAS_NAMESPACE ]] || return 1
-  ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null || return 1
-  IN_NAMESPACE=$NAMESPACE
-  return 0
-}
-
-show_active_vpns() {
-  local x= ns= dev= net= found=
-  echo
-  echo "Active VPNs in default namespace:"
-  for x in $(wg show interfaces); do
-    [[ $x == wgc_* ]] || continue
-    if read -r dev x net < <(ip -br -c address show $x 2>/dev/null); then
-      found=1
-      echo $dev $net
-    fi
-  done
-  [[ $found ]] || echo "  (none)"
-  found=
-  echo
-  echo "Active VPNs in other namespaces:"
-  while read -r ns x; do
-    dev=$ns
-    if ip netns exec $ns wg show $dev &>/dev/null && \
-    read -r dev x net < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null); then
-      found=1
-      echo $dev $net
-    fi
-  done < <(ip netns list 2>/dev/null)
-  [[ $found ]] || echo "  (none)"
-  echo
-}
-
-kill_processes() {
-  local pids=$1
-  echo -e "Terminating processes:\n$(ps -fp $pids)"
-  kill $pids &>/dev/null || true
-  # paint increasing bar for timeout
-  local h= d= timeout=10 # seconds
-  eval printf -v d "$'\u2591'%.0s" {1..$((timeout*2))} # timeout*2 LIGHT SHADEs in d
-  echo -ne "\033[?25l" # hide cursor
-  while [[ "$pids" && "$d" ]]; do
-    sleep 0.5
-    pids=$(ip netns pids $NAMESPACE 2>/dev/null)
-    d=${d%$'\u2591'} # remove one LIGHT SHADE
-    echo -ne "\r$h$d" # paint the bar over itself
-    h+=$'\u2588' # append a FULL BLOCK
-  done
-  echo -ne "\r\033[K\033[?25h" # delete bar and restore cursor
-  if [[ -z "$d" ]]; then # timeout
-    echo "Forcibly terminating processes (SIGKILL)"
-    kill -9 $pids &>/dev/null || true
-    sleep 0.1
-    # check again
-    pids=$(ip netns pids $NAMESPACE 2>/dev/null)
-    [[ $pids ]] && warn "Processes still running: $pids" || true
-  fi
-}
-
-is_valid_ident() {
-  local "$1" &>/dev/null
-}
-
-exec_in_namespace() {
-  [[ $# -eq 0 ]] && { error "No command specified"; show_usage; exit 1; }
-  is_connected || error "VPN $VPN is not connected. Start it first with: wgc nup $VPN" fatal
-  [[ $IN_NAMESPACE ]] || error "VPN $VPN is not in its own namespace. Just use plain command: $*" fatal
-
-  if [[ $(</proc/$PPID/comm) == sudo ]]; then
-    # wgc auto-elevated or executed with sudo.
-    # sudo inherits and sanitizes the original environment (depending on the active security policy) before executing wgc.
-
-    command -v setpriv >/dev/null || error "Missing command 'setpriv'" fatal
-    [[ ${SUDO_UID:-} ]] || error "Unable to determine invoking user (SUDO_UID missing)" fatal
-    [[ ${SUDO_GID:-} ]] || error "Unable to determine invoking group (SUDO_GID missing)" fatal
-
-    # Retrieve the Grandparent PID (field 4 of parent's stat).
-    # This identifies the correct source for the unsanitized environment:
-    # 1. Modern sudo (PTY mode): It targets the main sudo process (which holds the original env).
-    # 2. Legacy sudo: It targets the invoking shell directly.
-    # In both cases, reading this PID's environ bypasses the sanitization applied by the direct parent.
-    local grandpa_pid var_eq_val var
-    read -r _ _ _ grandpa_pid _ < /proc/$PPID/stat # get sudo pid
-    # Build the environment for the final command
-    local -a FINAL_ENV
-    while IFS= read -r -d '' var_eq_val; do
-      var=${var_eq_val%%=*}
-      [[ $var == @(PWD|_) ]] && continue
-      FINAL_ENV+=("$var_eq_val")
-    done < /proc/$grandpa_pid/environ
-
-    # Append the actual current PWD.
-    # wgc inherited the correct working directory from sudo (whether preserved or changed via sudo -i),
-    # so $PWD holds the authoritative value.
-    FINAL_ENV+=("PWD=$PWD")
-
-    # Final command
-    local PAYLOAD=(setpriv --reuid $SUDO_UID --regid $SUDO_GID --init-groups env -i "${FINAL_ENV[@]}" "$@")
-  else
-    [[ ${PKEXEC_UID:-} || ${DOAS_USER:-} ]] && \
-      error "Elevation detected but not supported (pkexec/doas).
-             Please use 'sudo wgc ...'" fatal
-    # wgc direct execution by root: no user/env switch needed
-    local PAYLOAD=("$@")
-  fi
-
-  # Execution with Anti-Leak protection (NSCD)
-  # If we are in a VPN namespace with custom DNS and the host's nscd socket exists,
-  # we must hide it to prevent glibc from using it and ignoring our DNS configuration.
-  local nscd_fix
-  if nscd_fix=$(get_nscd_fix_cmd); then
-    # Use an ephemeral mount namespace (unshare -m) to hide the socket.
-    # 'mount -t tmpfs' is safer than bind mounting on existing directories.
-    # Pass PAYLOAD as positional arguments to bash to avoid quoting issues.
-    exec ip netns exec $NAMESPACE \
-      unshare -m \
-      /bin/bash -c "$nscd_fix"' && exec "$@"' -- "${PAYLOAD[@]}"
-  else
-    # No leak risk or nscd not present
-    exec ip netns exec $NAMESPACE "${PAYLOAD[@]}"
-  fi
-}
-
-get_nscd_fix_cmd() {
-  [[ -f /etc/netns/$NAMESPACE/resolv.conf ]] || return 1
-
-  local cmd= found=
-
-  if [[ -S /var/run/nscd/socket ]]; then
-    cmd+="mount -t tmpfs -o size=1M,mode=755 none /var/run/nscd && "
-    found=1
-  fi
-  if [[ -S /run/nscd/socket ]]; then
-    cmd+="mount -t tmpfs -o size=1M,mode=755 none /run/nscd && "
-    found=1
-  fi
-
-  if command -v systemctl &>/dev/null && systemctl is-active -q nscd 2>/dev/null; then
-    warn "nscd service is active: applying isolation (socket mask + nsswitch override).
-          Warning: DNS leaks still possible if host nscd restarts during VPN usage."
-    found=1
-  fi
-
-  [[ $found ]] || return 1
-
-  cmd="mount --make-rprivate / 2>/dev/null && $cmd"
-
-  local nss_content=
-  if [[ -r /etc/nsswitch.conf ]]; then
-    nss_content=$(sed -E 's/[[:space:]]*\b(nscd|sss)\b//g' /etc/nsswitch.conf)
-  fi
-  if [[ -z $nss_content ]]; then
-    nss_content=$'passwd: files\ngroup: files\nhosts: files dns\nnetworks: files'
-  fi
-  nss_content=$'# Generated by wgc (nscd/sss removed to prevent DNS leaks)\n'$nss_content
-  cmd+="printf '%s' ${nss_content@Q} > /run/nsswitch.wgc && "
-  cmd+="mount --bind /run/nsswitch.wgc /etc/nsswitch.conf && "
-
-  echo "${cmd% && }"
-  return 0
-}
-
-validate_ipv4_kern() {
-  local ip=$1
-  ip -4 rule add to "$ip" &>/dev/null || return 1
-  ip -4 rule del to "$ip" &>/dev/null || true
-}
-
-validate_ipv4() {
-  # Define a single octet
-  # 25[0-5]     -> 250-255
-  # 2[0-4][0-9] -> 200-249
-  # 1[0-9][0-9] -> 100-199
-  # [1-9]?[0-9] -> 0-99
-  local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
-  local regex="^$oct\.$oct\.$oct\.$oct$"
-  [[ $1 =~ $regex ]]
-}
-
-enable_completion() {
-
-  local completion_dir=
-  for completion_dir in /etc/bash_completion.d /usr/share/bash-completion/completions ""; do
-    [[ -d "$completion_dir" ]] && break
-  done
-  [[ $completion_dir ]] || error "Cannot find bash completion directory" fatal
-  local completion_file="$completion_dir/wgc"
-
-  cat > "$completion_file" << 'EOF'
-_wgc_completion() {
-  local cur= prev= commands=
-  COMPREPLY=()
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-  # Main commands
-  commands="conf parse up fup xup nup down state active list exec req"
-
-  # Complete the first arg with main commands
-  if [[ $COMP_CWORD -eq 1 ]]; then
-    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
-    return 0
-  fi
-
-  # Complete the second arg depending on command
-  if [[ $COMP_CWORD -eq 2 ]]; then
-    case "$prev" in
-      u|up|f|fu|fup|x|xu|xup|n|nu|nup|c|co|con|conf|p|pa|par|pars|parse)
-        # VPN config file list
-        local v
-        local modtime=$(stat -c %y "${WGC_CFGDIR:-/etc/wireguard}" 2>/dev/null)
-        if [[ ! $_wgc_last_cfgdir_modtime || $modtime != "$_wgc_last_cfgdir_modtime" ]]; then
-          _wgc_last_cfgdir_modtime=$modtime
-          local -a c=( /usr/bin/find "${WGC_CFGDIR:-/etc/wireguard}" -maxdepth 1 -name \*.conf -type f )
-          local -a files
-          files=($("${c[@]}" 2>/dev/null)) || files=($(sudo "${c[@]}" 2>/dev/null)) || return 1
-          local f
-          for f in "${files[@]}"; do
-            f=${f##*/}; f=${f%.*}
-            [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-            v+="$f "
-          done
-          _wgc_last_cfgdir_list=$v
-        else
-          v=$_wgc_last_cfgdir_list
-        fi
-        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
-        ;;
-      d|do|dow|down|s|st|sta|stat|state)
-        # Active VPNs in default namespace
-        local -a ifaces
-        ifaces=($(wg show interfaces 2>/dev/null)) || ifaces=(sudo $(wg show interfaces 2>/dev/null)) || return 1
-        local i v
-        for i in "${ifaces[@]}"; do
-          [[ $i == wgc_* ]] || continue
-          v+="${i#*wgc_} "
-        done
-        # Active VPNs (namespaces)
-        local n
-        while read -r n _; do
-          [[ $n == wgc_* ]] || continue
-          v+="${n#*wgc_} "
-        done < <(/usr/sbin/ip netns list 2>/dev/null)
-        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
-        ;;
-      e|ex|exe|exec)
-        # Active VPNs (namespaces)
-        local n v
-        while read -r n _; do
-          [[ $n == wgc_* ]] || continue
-          v+="${n#*wgc_} "
-        done < <(/usr/sbin/ip netns list 2>/dev/null)
-        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
-        ;;
-    esac
-    return 0
-  fi
-
-  # For exec, after VPN name do complete with system commmands
-  if [[ $COMP_CWORD -gt 2 ]]; then
-    case "${COMP_WORDS[1]}" in
-      e|ex|exe|exec)
-        if declare -F _command_offset &>/dev/null; then
-          # Use advanced completion if available
-          _command_offset 3
-        else
-          # Fallback to basic completion
-          if [[ $COMP_CWORD -eq 3 ]]; then
-            COMPREPLY=( $(compgen -c -- "$cur") )
-          else
-            compopt -o default
-            COMPREPLY=()
-          fi
-        fi
-        return 0
-        ;;
-    esac
-  fi
-}
-
-complete -F _wgc_completion wgc
-EOF
-
-  chmod 644 "$completion_file"
-
-  # Pre-populated cache (generated at install time)
-  local f
-  _wgc_last_cfgdir_list=
-  for f in $(find "$CFGDIR" -maxdepth 1 -name \*.conf -type f); do
-    f=${f##*/}; f=${f%.*}
-    [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-    _wgc_last_cfgdir_list+="$f "
-  done
-  _wgc_last_cfgdir_modtime=$(stat -c %y "$CFGDIR" 2>/dev/null)
-  printf "%s\n" \
-    "_wgc_last_cfgdir_list=${_wgc_last_cfgdir_list@Q}" \
-    "_wgc_last_cfgdir_modtime=${_wgc_last_cfgdir_modtime@Q}" >> "$completion_file"
-
-  [[ $(stat -c %A "$CFGDIR") == *r?x ]] || \
-    warn "Completion for non-root users will use sudo to access configuration directory
-          whenever its modification time changes.
-          To avoid sudo consider: chmod o+rX '$CFGDIR' # directory only!
-          Otherwise add line for find command in sudoers as explained below.%%" fatal
-
-  cat << EOF
-$Y Bash completion installed to $completion_file
-
-To activate completion in current shell:
-  source $completion_file
-
-Completion will be automatically available in new shell sessions.
-
-To avoid sudo password prompt:
-  sudo visudo -f /etc/sudoers.d/wgc-completion
-  Then add:
-  %sudo ALL=(ALL) NOPASSWD: /usr/bin/find $CFGDIR -maxdepth 1 -name *.conf -type f
-EOF
-}
-
-stop_vpn() {
-  local p_force=
-  eval "$(get_params "$@")"
-
-  local stopping=
-  if is_connected; then
-    stopping=1
-    echo "Stopping $VPN ..."
-  else
-    warn "VPN $VPN is already stopped. Cleaning..."
-  fi
-
-  if [[ $HAS_NAMESPACE ]]; then
-    local pids=$(get_ns_pids)
-    if [[ $pids ]]; then
-      if [[ $p_force ]]; then
-        kill_processes "$pids"
-      else
-        error "Processes running in namespace $NAMESPACE:
-               $(ps -fp $pids)
-               Force stop (killing processes) with: wgc down $VPN force" fatal
-      fi
-    fi
-  fi
-
-  clean_vpn
-
-  if is_connected; then
-    warn "VPN $VPN is still active"
-  else
-    [[ $stopping ]] && echo "$Y VPN $VPN now stopped" || true
-  fi
-}
-
-clean_vpn() {
-
-  # Stop bridges
-  if command -v systemctl >/dev/null; then
-
-    local sockets_to_stop=$(systemctl list-units --all --type=socket --no-legend --plain "wgc.${VPN}.*" | cut -d ' ' -f 1)
-    if [[ $sockets_to_stop ]]; then
-      systemctl stop $sockets_to_stop 2>/dev/null || true
-    fi
-
-    local services_to_stop=$(systemctl list-units --all --type=service --no-legend --plain "wgc.${VPN}.*" | cut -d ' ' -f 1)
-    if [[ $services_to_stop ]]; then
-      systemctl stop $services_to_stop 2>/dev/null || true
-    fi
-
-    local all_units="$sockets_to_stop $services_to_stop"
-    if [[ $all_units ]]; then
-      systemctl reset-failed $all_units 2>/dev/null || true
-    fi
-
-    rm -f /run/wgc.${VPN}.*.sock 2>/dev/null || true
-
-  fi
-
-  # DNS restore: remove configuration associated with $DEV
-  # If openresolv is missing or fails, proceed anyway
-  resolvconf -d $DEV &>/dev/null || true
-  rm -rf /etc/netns/$NAMESPACE &>/dev/null || true
-
-  if is_connected; then # Set HAS_NAMESPACE IN_NAMESPACE
-    # Remove route protecting Wireguard endpoint
-    del_endpoint_host_route
-    if [[ $IN_NAMESPACE ]]; then
-      # Remove interface and related things
-      ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
-    else
-      # Remove source routing rule
-      del_source_routing
-      # Remove interface and related things
-      ip link del $DEV &>/dev/null || true
-    fi
-  fi
-
-  if [[ $HAS_NAMESPACE ]]; then
-    # Remove namespace
-    # Note: Processes that were in the deleted namespace lose network connectivity
-    # but continue running.
-    ip netns del $NAMESPACE &>/dev/null || true
-  fi
-}
-
-start_transient_service() {
-  local unit_name=$1
-  shift # Shift off the first argument (unit name); the rest remains in "$@"
-
-  command -v systemd-run >/dev/null || error "Systemd is required but not found (systemd-run)." fatal
-
-  # Start the service
-  # "$@" contains both the extra properties and the final command
-  systemd-run --quiet --unit="$unit_name" \
-    --description="WGC Service $unit_name" \
-    --service-type=simple \
-    --property=Restart=always \
-    --property=RestartSec=1 \
-    --property=StartLimitBurst=3 \
-    --property=StartLimitIntervalSec=10 \
-    --setenv=WGC_BRIDGE=1 \
-    --property=SuccessExitStatus=143 \
-    "$@" || warn "Command systemd-run failed for unit '$unit_name'."
+del_source_routing() {
+  [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
+    ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
 }
 
 configure_vpn_in_namespace() {
@@ -1244,148 +593,58 @@ configure_vpn_in_namespace() {
   fi
 }
 
-configure_vpn_plain() {
-  # Configure interface $DEV
-  ip addr add "$Address" dev $DEV || error "Failed to configure address '$Address' for interface '$DEV'" fatal
-  [[ $MTU ]] && {
-    ip link set $DEV mtu $MTU || error "Failed to configure MTU '$MTU' for interface '$DEV'" fatal
-  }
-  ip link set $DEV up || error "Failed to bring up interface '$DEV' with address '$Address'" fatal
+start_transient_service() {
+  local unit_name=$1
+  shift # Shift off the first argument (unit name); the rest remains in "$@"
 
-  # Always add default route valid only for source $Address (source policy routing)
-  set_source_routing
+  command -v systemd-run >/dev/null || error "Systemd is required but not found (systemd-run)." fatal
 
-  if [[ $CMD != xup* ]]; then
-    if [[ $CMD == fup ]]; then
-      set_override_default_route
-    else
-      local set_override=
-      for k in $AllowedIPs; do
-        [[ $k == "0.0.0.0/0" ]] && { set_override=1; continue; }
-        ip route add "$k" dev $DEV || error "Cannot add route to $k" fatal
-      done
-      [[ $set_override ]] && set_override_default_route
-    fi
-  fi
-
-  if [[ $CMD != xup && $DNS ]]; then
-    # Configure DNS
-    local k= q=
-    for k in $DNS; do
-      if validate_ipv4 "$k"; then
-        q+="nameserver $k"$'\n'
-        [[ $CMD == xupd ]] && ip route add "$k" dev "$DEV" 2>/dev/null || true
-      else
-        warn "Skipping invalid DNS server '$k'"
-      fi
-    done
-    if [[ $q ]]; then
-      echo "$q" | resolvconf -a $DEV -m 0 -x || \
-        warn "DNS configuration failed.
-              Ensure 'openresolv' is properly installed and configured."
-    else
-      warn "Could not find any valid ip address in DNS parameter"
-    fi
-  fi
+  # Start the service
+  # "$@" contains both the extra properties and the final command
+  systemd-run --quiet --unit="$unit_name" \
+    --description="WGC Service $unit_name" \
+    --service-type=simple \
+    --property=Restart=always \
+    --property=RestartSec=1 \
+    --property=StartLimitBurst=3 \
+    --property=StartLimitIntervalSec=10 \
+    --setenv=WGC_BRIDGE=1 \
+    --property=SuccessExitStatus=143 \
+    "$@" || warn "Command systemd-run failed for unit '$unit_name'."
 }
 
-set_override_default_route() {
-  ip route add 0/1 dev $DEV || error "Cannot set default route override 0.0.0.0/1" fatal blameparent
-  ip route add 128/1 dev $DEV || error "Cannot set default route override 128.0.0.0/1" fatal blameparent
-}
+stop_vpn() {
+  local p_force=
+  eval "$(get_params "$@")"
 
-set_endpoint_host_route() {
-  local ep=${Endpoint%%:*} route
-  local -a route_args
-  validate_ipv4 "$ep" || read -r ep _ < <(getent ahostsv4 "$ep") || \
-    error "Cannot resolve Endpoint name '$ep'" fatal blameparent
-  route=$(ip -j route get "$ep" 2>/dev/null) || error "Cannot find route to Endpoint $ep" fatal blameparent
-  [[ $route =~ \"gateway\":\"([^\"]+)\" ]] && route_args+=(via "${BASH_REMATCH[1]}")
-  [[ $route =~ \"dev\":\"([^\"]+)\" ]] || error "Cannot determine output device for Endpoint $ep" fatal blameparent
-  route_args+=(dev "${BASH_REMATCH[1]}")
-  ip route add "$ep" "${route_args[@]}" || error "Cannot set host route to Endpoint $ep" fatal blameparent
-}
-
-del_endpoint_host_route() {
-  local nscmd=
-  [[ $HAS_NAMESPACE ]] && nscmd="ip netns exec $NAMESPACE"
-  local -a ep=()
-  ep=($($nscmd wg show $DEV endpoints)) && {
-    [[ ${ep[1]:-} ]] && {
-      ep=${ep[1]%%:*}
-      ip route del $ep &>/dev/null || true
-    }
-  } || true
-}
-
-set_source_routing() {
-  local -i t
-  for ((t=51820; t<65536; t++))
-    [[ $(ip route show table $t 2>/dev/null) ]] || break
-  done
-  ((t > 65535)) && error "Cannot find an empty routing table in the range 51820..65535" fatal
-  ip route add default dev $DEV table $t
-  ip rule add from ${Address%/*} table $t
-}
-
-del_source_routing() {
-  [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]] && \
-    ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
-}
-
-start_vpn() {
-  is_connected && \
-    error "$VPN is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
-           To reconnect, first stop it: wgc down $VPN" fatal
-
-  [[ $CMD == nup ]] || check_openresolv
-
-  # get parameters and forwarding bridges from config file named $VPN
-  parse_config_file $VPN ${p_nup:+bridges}
-
-  push_cleanup clean_vpn
-
-  # Create WireGuard interface
-  ip link add dev $DEV type wireguard || error "Failed to create WireGuard interface '$DEV'" fatal
-
-  # Override AllowedIPs for Full Tunnel mode (fup) or Bind-Only modes (xup/xupd).
-  # Instructs WireGuard to allow all traffic in and out of the tunnel.
-  if [[ $CMD == @(fup|xup*) ]]; then
-    AllowedIPs="0.0.0.0/0" # add " ::/0" if IPv6 supported
-  fi
-
-  # Configure WireGuard
-  # Notice: this was tested against possible attack vectors, do not modify the general approach!
-  local wgcmd='wg set $DEV'
-  [[ $ListenPort ]] && wgcmd+=' listen-port "$ListenPort"'
-  [[ $FwMark ]] && wgcmd+=' fwmark "$FwMark"'
-  wgcmd+=' private-key <(printf %s "$PrivateKey")'
-  wgcmd+=' peer "$PublicKey"'
-  wgcmd+=' allowed-ips "${AllowedIPs// /,}"'
-  wgcmd+=' endpoint "$Endpoint"'
-  [[ $PresharedKey ]] && wgcmd+=' preshared-key <(printf %s "$PresharedKey")'
-  [[ $PersistentKeepalive ]] && wgcmd+=' persistent-keepalive "$PersistentKeepalive"'
-  eval "$wgcmd" || {
-    eval $'read -r -d "" wgcmd <<EOF\n'"${wgcmd/\$PrivateKey/<HIDDEN>}"$'\nEOF' || true
-    error "Failed to configure WireGuard interface '$DEV' using command:
-           $wgcmd" fatal
-  }
-
-  # Protect endpoint reachability against:
-  # - override routes 0/1 and 128/1 possibly added in configure_vpn_plain()
-  # - bad routes added in configure_vpn_plain() due to AllowedIPs
-  # - bad routes added outside wgc after VPN start
-  set_endpoint_host_route
-
-  if [[ $CMD == nup ]]; then
-    configure_vpn_in_namespace
+  local stopping=
+  if is_connected; then
+    stopping=1
+    echo "Stopping $VPN ..."
   else
-    configure_vpn_plain
+    warn "VPN $VPN is already stopped. Cleaning..."
   fi
 
-  pop_cleanup clean_vpn
+  if [[ $HAS_NAMESPACE ]]; then
+    local pids=$(get_ns_pids)
+    if [[ $pids ]]; then
+      if [[ $p_force ]]; then
+        kill_processes "$pids"
+      else
+        error "Processes running in namespace $NAMESPACE:
+               $(ps -fp $pids)
+               Force stop (killing processes) with: wgc down $VPN force" fatal
+      fi
+    fi
+  fi
 
-  show_state
+  clean_vpn
+
+  if is_connected; then
+    warn "VPN $VPN is still active"
+  else
+    [[ $stopping ]] && echo "$Y VPN $VPN now stopped" || true
+  fi
 }
 
 get_ns_pids() {
@@ -1400,60 +659,80 @@ get_ns_pids() {
   echo $pids
 }
 
-show_bridges() {
-  # Format: UNIT LOAD ACTIVE SUB DESCRIPTION
-  local output=$(systemctl list-units --all --full --type=service,socket --no-legend --plain "wgc.${VPN}.*")
+kill_processes() {
+  local pids=$1
+  echo -e "Terminating processes:\n$(ps -fp $pids)"
+  kill $pids &>/dev/null || true
+  # paint increasing bar for timeout
+  local h= d= timeout=10 # seconds
+  eval printf -v d "$'\u2591'%.0s" {1..$((timeout*2))} # timeout*2 LIGHT SHADEs in d
+  echo -ne "\033[?25l" # hide cursor
+  while [[ "$pids" && "$d" ]]; do
+    sleep 0.5
+    pids=$(ip netns pids $NAMESPACE 2>/dev/null)
+    d=${d%$'\u2591'} # remove one LIGHT SHADE
+    echo -ne "\r$h$d" # paint the bar over itself
+    h+=$'\u2588' # append a FULL BLOCK
+  done
+  echo -ne "\r\033[K\033[?25h" # delete bar and restore cursor
+  if [[ -z "$d" ]]; then # timeout
+    echo "Forcibly terminating processes (SIGKILL)"
+    kill -9 $pids &>/dev/null || true
+    sleep 0.1
+    # check again
+    pids=$(ip netns pids $NAMESPACE 2>/dev/null)
+    [[ $pids ]] && warn "Processes still running: $pids" || true
+  fi
+}
 
-  if [[ $output ]]; then
-    echo
-    prc "+W  %-18s %-19s %-8s %s+/\n" Bridge "ExtPort -> IntPort" Type Status
-    prc "+A  %-18s %-19s %-8s %s+/\n" ------ "------------------" ---- ------
+clean_vpn() {
 
-    # Load all info in hash maps for instant lookup
-    local -A u_active u_desc
-    local u load active sub desc
-    while read -r u load active sub desc; do
-      u_active[$u]=$active
-      u_desc[$u]=$desc
-    done <<< "$output"
+  # Stop bridges
+  if command -v systemctl >/dev/null; then
 
-    # Iterate an print
-    for u in "${!u_active[@]}"; do
-      # Only one line per each external Listener
-      [[ $u != *.ext.* ]] && continue
+    local sockets_to_stop=$(systemctl list-units --all --type=socket --no-legend --plain "wgc.${VPN}.*" | cut -d ' ' -f 1)
+    if [[ $sockets_to_stop ]]; then
+      systemctl stop $sockets_to_stop 2>/dev/null || true
+    fi
 
-      desc="${u_desc[$u]}"; active="${u_active[$u]}"
+    local services_to_stop=$(systemctl list-units --all --type=service --no-legend --plain "wgc.${VPN}.*" | cut -d ' ' -f 1)
+    if [[ $services_to_stop ]]; then
+      systemctl stop $services_to_stop 2>/dev/null || true
+    fi
 
-      # Parse unit description.
-      # Example: WGC Listener (proxyd) 'Privoxy' 8081 -> 8080
-      #                        tool     name     p_ext   p_int
-      local regex="\(([^)]+)\) '([^']+)' ([0-9]+) -> ([0-9]+)"
-      if [[ $desc =~ $regex ]]; then
-        tool=${BASH_REMATCH[1]}
-        name=${BASH_REMATCH[2]}
-        p_ext=${BASH_REMATCH[3]}
-        p_int=${BASH_REMATCH[4]}
-        # We are interested only in sockets (proxyd) or socat services
-        if [[ $u == *.socket ]] || [[ $tool == "socat" ]]; then
-          local status_str=$active
-          case "$active" in
-            active)               status_str="$Y $status_str" ;;
-            failed)               status_str="$X $status_str" ;;
-            activating|reloading) status_str=$'\u25cf'" $status_str" ;;
-            *)                    status_str="- $status_str" ;;
-          esac
+    local all_units="$sockets_to_stop $services_to_stop"
+    if [[ $all_units ]]; then
+      systemctl reset-failed $all_units 2>/dev/null || true
+    fi
 
-          local int_unit="wgc.${VPN}.${name}.int.socket" # proxyd
-          [[ $tool == socat ]] && int_unit="wgc.${VPN}.${name}.int.service"
-          local int_status="${u_active[$int_unit]:-missing}"
-          [[ $int_status != active ]] && status_str+=" / Int: $X $int_status"
+    rm -f /run/wgc.${VPN}.*.sock 2>/dev/null || true
 
-          prc "+y  %-18s+/ +G%-7s +A%-2s +c%-8s+/ %-8s %s\n" "$name" "$p_ext" "->" "$p_int" "$tool" "$status_str"
-        fi
-      fi
-    done | sort # hash map order is undefined
-  else
-    echo "  (none)"
+  fi
+
+  # DNS restore: remove configuration associated with $DEV
+  # If openresolv is missing or fails, proceed anyway
+  resolvconf -d $DEV &>/dev/null || true
+  rm -rf /etc/netns/$NAMESPACE &>/dev/null || true
+
+  if is_connected; then # Set HAS_NAMESPACE IN_NAMESPACE
+    # Remove route protecting Wireguard endpoint
+    del_endpoint_host_route
+    if [[ $IN_NAMESPACE ]]; then
+      # Remove interface and related things
+      ip netns exec $NAMESPACE ip link del $DEV &>/dev/null || true
+    else
+      # Remove source routing rule
+      del_source_routing
+      # Remove interface and related things
+      ip link del $DEV &>/dev/null || true
+    fi
+  fi
+
+  if [[ $HAS_NAMESPACE ]]; then
+    # Remove namespace
+    # Note: Processes that were in the deleted namespace lose network connectivity
+    # but continue running.
+    ip netns del $NAMESPACE &>/dev/null || true
   fi
 }
 
@@ -1514,6 +793,768 @@ show_state() {
   else
     warn "VPN $VPN is DISCONNECTED"
   fi
+}
+
+show_bridges() {
+  # Format: UNIT LOAD ACTIVE SUB DESCRIPTION
+  local output=$(systemctl list-units --all --full --type=service,socket --no-legend --plain "wgc.${VPN}.*")
+
+  if [[ $output ]]; then
+    echo
+    prc "+W  %-18s %-19s %-8s %s+/\n" Bridge "ExtPort -> IntPort" Type Status
+    prc "+A  %-18s %-19s %-8s %s+/\n" ------ "------------------" ---- ------
+
+    # Load all info in hash maps for instant lookup
+    local -A u_active u_desc
+    local u load active sub desc
+    while read -r u load active sub desc; do
+      u_active[$u]=$active
+      u_desc[$u]=$desc
+    done <<< "$output"
+
+    # Iterate an print
+    for u in "${!u_active[@]}"; do
+      # Only one line per each external Listener
+      [[ $u != *.ext.* ]] && continue
+
+      desc="${u_desc[$u]}"; active="${u_active[$u]}"
+
+      # Parse unit description.
+      # Example: WGC Listener (proxyd) 'Privoxy' 8081 -> 8080
+      #                        tool     name     p_ext   p_int
+      local regex="\(([^)]+)\) '([^']+)' ([0-9]+) -> ([0-9]+)"
+      if [[ $desc =~ $regex ]]; then
+        tool=${BASH_REMATCH[1]}
+        name=${BASH_REMATCH[2]}
+        p_ext=${BASH_REMATCH[3]}
+        p_int=${BASH_REMATCH[4]}
+        # We are interested only in sockets (proxyd) or socat services
+        if [[ $u == *.socket ]] || [[ $tool == "socat" ]]; then
+          local status_str=$active
+          case "$active" in
+            active)               status_str="$Y $status_str" ;;
+            failed)               status_str="$X $status_str" ;;
+            activating|reloading) status_str=$'\u25cf'" $status_str" ;;
+            *)                    status_str="- $status_str" ;;
+          esac
+
+          local int_unit="wgc.${VPN}.${name}.int.socket" # proxyd
+          [[ $tool == socat ]] && int_unit="wgc.${VPN}.${name}.int.service"
+          local int_status="${u_active[$int_unit]:-missing}"
+          [[ $int_status != active ]] && status_str+=" / Int: $X $int_status"
+
+          prc "+y  %-18s+/ +G%-7s +A%-2s +c%-8s+/ %-8s %s\n" "$name" "$p_ext" "->" "$p_int" "$tool" "$status_str"
+        fi
+      fi
+    done | sort # hash map order is undefined
+  else
+    echo "  (none)"
+  fi
+}
+
+show_active_vpns() {
+  local x= ns= dev= net= found=
+  echo
+  echo "Active VPNs in default namespace:"
+  for x in $(wg show interfaces); do
+    [[ $x == wgc_* ]] || continue
+    if read -r dev x net < <(ip -br -c address show $x 2>/dev/null); then
+      found=1
+      echo $dev $net
+    fi
+  done
+  [[ $found ]] || echo "  (none)"
+  found=
+  echo
+  echo "Active VPNs in other namespaces:"
+  while read -r ns x; do
+    dev=$ns
+    if ip netns exec $ns wg show $dev &>/dev/null && \
+    read -r dev x net < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null); then
+      found=1
+      echo $dev $net
+    fi
+  done < <(ip netns list 2>/dev/null)
+  [[ $found ]] || echo "  (none)"
+  echo
+}
+
+list_config_files() {
+  local f= g=
+  echo -e "Looking in $CFGDIR\n"
+  prc "+W%-12s %-4s %-18s %-29s %s+/\n" Name Br. Address Endpoint AllowedIPs
+  prc "+A%-12s %-4s %-18s %-29s %s+/\n" ---- --- ------- -------- ----------
+  for f in "$CFGDIR"/*.conf; do
+    g=${f##*/}; g=${g%.*}
+    [[ $g =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
+    parse_config_file "$g" bridges relax || continue
+    (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
+    prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#WGC_BRIDGES[@]} "$Address" "$Endpoint" "$AllowedIPs"
+  done
+}
+
+show_config_file() {
+  local -r config_file="$CFGDIR/$VPN.conf"
+  [[ -f $config_file ]] || error "Not a file: $config_file"
+  [[ -r $config_file ]] || error "Cannot read file: $config_file"
+  printf %s\\n "$(< $config_file)"
+}
+
+show_parsed_config_file() {
+  parse_config_file $VPN bridges report
+  show_config
+}
+
+show_config() {
+  echo
+  prc "+W%-20s%s+/\n" Key  Value
+  prc "+A%-20s%s+/\n"     ---- -----
+  local pub val
+  for k in Address DNS MTU ListenPort FwMark PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
+    val=${!k:-(missing)}
+    [[ $k == PrivateKey && ${!k} ]] && val="<HIDDEN>"
+    prc "+c%-20s+Y${!k:++/}%s+/" $k "$val"
+    if [[ $k ==  P*Key && ${!k} ]]; then
+      if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
+        [[ $k == PrivateKey ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
+      else
+        prc " $W +R%s+/ " invalid
+      fi
+    fi
+    [[ $k == @(Address|PrivateKey|PublicKey|Endpoint|AllowedIPs) && ! ${!k} ]] && prc " $W +R%s+/ " required
+    printf "\n"
+  done
+  if (( ${#WGC_BRIDGES[@]} > 0 )); then
+    echo
+    local bridge_data b_name b_ext b_int
+    prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
+    prc "+A%-20s%s+/\n"      -----------------   ------------------
+    for bridge_data in "${WGC_BRIDGES[@]}"; do
+      IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
+      prc "+y%-19s+/ %s +A%s+/ %s\n" "$b_name" "$b_ext" "->" "$b_int"
+    done
+  fi
+  echo
+}
+
+parse_config_file() {
+  local -r config_file="$CFGDIR/$1.conf"; shift 1
+  local p_relax= p_report= p_bridges=
+  eval "$(get_params "$@")"
+
+  local fatal=fatal; [[ $p_relax ]] && fatal=
+
+  [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
+  [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
+  local line= n=0 s=0 section= key= value= ISSUES= section_valid=
+  Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= DNS= MTU= ListenPort= FwMark= PersistentKeepalive= PresharedKey=
+  WGC_BRIDGES=()
+  local -A SEEN_SECTIONS=() USED_BRPORTS=() USED_BRNAMES=()
+  while read -r line || [[ $line ]]; do # also read last line if \n is missing
+      ((++n))
+      line=${line%%#*} # Remove comments
+      [[ ! $line =~ [^[:space:]] ]] && continue # Skip empty lines
+      if [[ $line =~ ^[[:space:]]*(\[[A-Za-z0-9_-]+\])[[:space:]]*$ ]]; then
+        # This line is a section.
+        section=${BASH_REMATCH[1]} # Track section
+        s=$n # remember section line number
+        if process_config_line checksection; then
+          # Section is valid.
+          # If section was seen before, mark it as bad...
+          if [[ -v SEEN_SECTIONS[$section] ]]; then
+            ISSUES+=$'\n'"Ignored duplicate section $section at line $s"
+            section=BADSECTION
+            continue
+          fi
+          # Otherwise, register it as seen.
+          SEEN_SECTIONS[$section]=1
+          continue
+        else # Section is unknown.
+          ISSUES+=$'\n'"Unknown section '$section' at line $s"
+          section=BADSECTION
+          continue
+        fi
+      fi
+      # This line is not a section.
+      # Skip lines in bad sections (even before all sections)
+      case "$section" in
+        BADSECTION) continue ;;
+        "") ISSUES+=$'\n'"Ignored data before sections at line $n"
+            section=BADSECTION ;;
+      esac
+      # Parse key=value with flexible spacing
+      if [[ $line =~ ^[[:space:]]*([A-Za-z0-9]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]]) ]]; then
+        key=${BASH_REMATCH[1]}   # key without spaces
+        value=${BASH_REMATCH[2]} # value trimmed
+      else # Not a key=value line
+        ISSUES+=$'\n'"Malformed line $n: ${line:0:50}$( ((${#line} > 50)) && echo ... || true )"
+        continue
+      fi
+      # Get values according to section/key
+      process_config_line || true
+  done < "$config_file"
+  if [[ ! $p_relax ]]; then
+    for n in Address PrivateKey PublicKey Endpoint AllowedIPs; do
+      [[ ${!n} ]] || \
+        if [[ $p_report ]]; then
+          ISSUES+=$'\n'"Missing required key '$n'"
+        else
+          error "Missing required key '$n' in file $config_file" fatal blameparent
+        fi
+    done
+    [[ $ISSUES ]] && warn "Issues in $config_file:$ISSUES" || true
+  fi
+}
+
+process_config_line() {
+  [[ ${1:-} == checksection ]] && key=_checksection_
+  case "$section" in
+    "[Interface]")
+      case "$key" in
+        _checksection_) return 0 ;;
+        Address) extract_ipv4 "$value" Address ;;
+        DNS) extract_all_ipv4 "$value" ' ' DNS ;;
+        MTU) MTU=$value ;;
+        PrivateKey) PrivateKey=$value ;;
+        ListenPort)
+          ListenPort=$value
+          [[ is_valid_port $ListenPort ]] && return 0
+          ISSUES+=$'\n'"Invalid ListenPort value at line $n (must be 1-65535): $ListenPort"
+          return 1
+          ;;
+        FwMark) FwMark=$value ;;
+        *) ISSUES+=$'\n'"Unknown key '$key' in section '$section' at line $n"; return 0 ;;
+      esac
+      ;;
+    "[Peer]")
+      case "$key" in
+        _checksection_) return 0 ;;
+        AllowedIPs) extract_all_ipv4 "cidr$value" ' ' AllowedIPs ;;
+        Endpoint)
+          if [[ ! $Endpoint =~ ([-A-Za-z0-9.]+):([0-9]+) ]]; then
+            ISSUES+=$'\n'"Invalid Endpoint value '$Endpoint' at line $n"
+            return 1
+          fi
+          Endpoint=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
+          if ! is_valid_port "$port"; then
+            ISSUES+=$'\n'"Invalid port '$ep_port' in Endpoint at line $n"
+            return 1
+          fi
+          validate_ipv4 "$Endpoint" || read -r Endpoint _ < <(getent ahostsv4 "$ep_host") || \
+          XXX
+
+          Endpoint=$value ;;
+        PersistentKeepalive) PersistentKeepalive=$value ;;
+        PresharedKey) PresharedKey=$value ;;
+        PublicKey) PublicKey=$value ;;
+        *) ISSUES+=$'\n'"Unknown key '$key' in section '$section' at line $n"; return 0 ;;
+      esac
+      ;;
+    "[WGC-Bridges]")
+      [[ $key == _checksection_ ]] && return 0
+      [[ $p_bridges ]] || return 0
+      # Sintax: <bridgename> = <externalport>-<internalport>
+      # Example: qBittorrent = 8765-8765
+      if [[ ! $key =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        ISSUES+=$'\n'"Invalid bridge name '$key' at line $n (chars allowed: A-Z, a-z, 0-9, _, -)"
+        return 0
+      fi
+      if [[ -v USED_BRNAMES[$key] ]]; then
+        ISSUES+=$'\n'"Duplicate bridge name '$key' at lines $n and ${USED_BRNAMES[$key]}"
+        return 0
+      fi
+      if [[ $value =~ ^([0-9]+)[[:space:]]*-[[:space:]]*([0-9]+)$ ]]; then
+        local ext_port="${BASH_REMATCH[1]}"
+        local int_port="${BASH_REMATCH[2]}"
+        if ! is_valid_port $ext_port || ! is_valid_port $int_port; then
+          ISSUES+=$'\n'"Invalid port at line $n (must be 1-65535): $value"
+          return 0
+        fi
+        if [[ -v USED_BRPORTS[$ext_port] ]]; then
+          ISSUES+=$'\n'"Duplicate external port $ext_port for bridge '$key' at line $n (already used by '${USED_BRPORTS[$ext_port]}')"
+          return 0
+        fi
+        USED_BRNAMES[$key]=$n
+        USED_BRPORTS[$ext_port]=$key
+        WGC_BRIDGES+=("$key:$ext_port:$int_port")
+      else
+        ISSUES+=$'\n'"Invalid bridge format '$value' at line $n. Use: external-internal (e.g., 4321-1234)"
+        return 0
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+is_valid_port() {
+  local p=$1
+  [[ $p =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535))
+}
+
+extract_ipv4() { # Appends to ${!2}
+  local _in=$1
+  local -n _out=$2
+  local _regex='([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?'
+  [[ $_in =~ $_regex ]] && _out="${BASH_REMATCH[0]}" || _out=
+}
+
+extract_all_ipv4() {
+  local _in=$1
+  local _sep=${2:- }
+  local -n _out=$3
+  local _regex='([0-9]{1,3}\.){3}[0-9]{1,3}' match
+  [[ "$_in" == cidr* ]] && _regex+='(/[0-9]+)?'
+  while [[ $_in =~ $_regex ]]; do
+    match=${BASH_REMATCH[0]}
+    if is_valid_ip4 "$match"; then
+      _out+=$_sep$match
+    else
+      ISSUES+=$'\n'"Ignored invalid IPv4 value at line $n: '$match' (octets must be 0-255, prefix 0-32)"
+    fi
+    # Remove found match and go on
+    _in=${_in#*"$match"}
+  done
+  _out=${_out#$_sep} # Remove initial separator if present
+}
+
+is_valid_ipv4() {
+  local IFS=./ n1 n2 n3 n4 prefix
+  read -r n1 n2 n3 n4 prefix <<< "$1"
+  (( 10#$n1 <= 255 && 10#$n2 <= 255 && 10#$n3 <= 255 && 10#$n4 <= 255 )) || return 1
+  (( 10#${prefix:-0} <= 32 )) || return 1
+}
+
+check_dependencies() {
+  local missing=()
+  for cmd in tput ip wg grep resolvconf mkdir rm ps sleep find curl sed setpriv socat; do
+    command -v $cmd >/dev/null || missing+=($cmd)
+  done
+  if (( ${#missing[@]} > 0 )); then
+    error "Missing required commands: ${missing[*]}
+           Install with:
+           apt install wireguard-tools iproute2 grep sed coreutils \\
+           procps findutils openresolv util-linux ncurses-bin" fatal blameparent
+  fi
+  echo "$Y All required commands are available."
+}
+
+exec_in_namespace() {
+  [[ $# -eq 0 ]] && { error "No command specified"; show_usage; exit 1; }
+  is_connected || error "VPN $VPN is not connected. Start it first with: wgc nup $VPN" fatal
+  [[ $IN_NAMESPACE ]] || error "VPN $VPN is not in its own namespace. Just use plain command: $*" fatal
+
+  if [[ $(</proc/$PPID/comm) == sudo ]]; then
+    # wgc auto-elevated or executed with sudo.
+    # sudo inherits and sanitizes the original environment (depending on the active security policy) before executing wgc.
+
+    command -v setpriv >/dev/null || error "Missing command 'setpriv'" fatal
+    [[ ${SUDO_UID:-} ]] || error "Unable to determine invoking user (SUDO_UID missing)" fatal
+    [[ ${SUDO_GID:-} ]] || error "Unable to determine invoking group (SUDO_GID missing)" fatal
+
+    # Retrieve the Grandparent PID (field 4 of parent's stat).
+    # This identifies the correct source for the unsanitized environment:
+    # 1. Modern sudo (PTY mode): It targets the main sudo process (which holds the original env).
+    # 2. Legacy sudo: It targets the invoking shell directly.
+    # In both cases, reading this PID's environ bypasses the sanitization applied by the direct parent.
+    local grandpa_pid var_eq_val var
+    read -r _ _ _ grandpa_pid _ < /proc/$PPID/stat # get sudo pid
+    # Build the environment for the final command
+    local -a FINAL_ENV
+    while IFS= read -r -d '' var_eq_val; do
+      var=${var_eq_val%%=*}
+      [[ $var == @(PWD|_) ]] && continue
+      FINAL_ENV+=("$var_eq_val")
+    done < /proc/$grandpa_pid/environ
+
+    # Append the actual current PWD.
+    # wgc inherited the correct working directory from sudo (whether preserved or changed via sudo -i),
+    # so $PWD holds the authoritative value.
+    FINAL_ENV+=("PWD=$PWD")
+
+    # Final command
+    local PAYLOAD=(setpriv --reuid $SUDO_UID --regid $SUDO_GID --init-groups env -i "${FINAL_ENV[@]}" "$@")
+  else
+    [[ ${PKEXEC_UID:-} || ${DOAS_USER:-} ]] && \
+      error "Elevation detected but not supported (pkexec/doas).
+             Please use 'sudo wgc ...'" fatal
+    # wgc direct execution by root: no user/env switch needed
+    local PAYLOAD=("$@")
+  fi
+
+  # Execution with Anti-Leak protection (NSCD)
+  # If we are in a VPN namespace with custom DNS and the host's nscd socket exists,
+  # we must hide it to prevent glibc from using it and ignoring our DNS configuration.
+  local nscd_fix
+  if nscd_fix=$(get_nscd_fix_cmd); then
+    # Use an ephemeral mount namespace (unshare -m) to hide the socket.
+    # 'mount -t tmpfs' is safer than bind mounting on existing directories.
+    # Pass PAYLOAD as positional arguments to bash to avoid quoting issues.
+    exec ip netns exec $NAMESPACE \
+      unshare -m \
+      /bin/bash -c "$nscd_fix"' && exec "$@"' -- "${PAYLOAD[@]}"
+  else
+    # No leak risk or nscd not present
+    exec ip netns exec $NAMESPACE "${PAYLOAD[@]}"
+  fi
+}
+
+get_nscd_fix_cmd() {
+  [[ -f /etc/netns/$NAMESPACE/resolv.conf ]] || return 1
+
+  local cmd= found=
+
+  if [[ -S /var/run/nscd/socket ]]; then
+    cmd+="mount -t tmpfs -o size=1M,mode=755 none /var/run/nscd && "
+    found=1
+  fi
+  if [[ -S /run/nscd/socket ]]; then
+    cmd+="mount -t tmpfs -o size=1M,mode=755 none /run/nscd && "
+    found=1
+  fi
+
+  if command -v systemctl &>/dev/null && systemctl is-active -q nscd 2>/dev/null; then
+    warn "nscd service is active: applying isolation (socket mask + nsswitch override).
+          Warning: DNS leaks still possible if host nscd restarts during VPN usage."
+    found=1
+  fi
+
+  [[ $found ]] || return 1
+
+  cmd="mount --make-rprivate / 2>/dev/null && $cmd"
+
+  local nss_content=
+  if [[ -r /etc/nsswitch.conf ]]; then
+    nss_content=$(sed -E 's/[[:space:]]*\b(nscd|sss)\b//g' /etc/nsswitch.conf)
+  fi
+  if [[ -z $nss_content ]]; then
+    nss_content=$'passwd: files\ngroup: files\nhosts: files dns\nnetworks: files'
+  fi
+  nss_content=$'# Generated by wgc (nscd/sss removed to prevent DNS leaks)\n'$nss_content
+  cmd+="printf '%s' ${nss_content@Q} > /run/nsswitch.wgc && "
+  cmd+="mount --bind /run/nsswitch.wgc /etc/nsswitch.conf && "
+
+  echo "${cmd% && }"
+  return 0
+}
+
+enable_completion() {
+
+  local completion_dir=
+  for completion_dir in /etc/bash_completion.d /usr/share/bash-completion/completions ""; do
+    [[ -d "$completion_dir" ]] && break
+  done
+  [[ $completion_dir ]] || error "Cannot find bash completion directory" fatal
+  local completion_file="$completion_dir/wgc"
+
+  cat > "$completion_file" << 'EOF'
+_wgc_completion() {
+  local cur= prev= commands=
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  # Main commands
+  commands="conf parse up fup bup bupd nup down state active list exec req"
+
+  # Complete the first arg with main commands
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+    return 0
+  fi
+
+  # Complete the second arg depending on command
+  if [[ $COMP_CWORD -eq 2 ]]; then
+    case "$prev" in
+      u|up|f|fu|fup|bup|bupd|n|nu|nup|c|co|con|conf|p|pa|par|pars|parse)
+        # VPN config file list
+        local v
+        local modtime=$(stat -c %y "${WGC_CFGDIR:-/etc/wireguard}" 2>/dev/null)
+        if [[ ! $_wgc_last_cfgdir_modtime || $modtime != "$_wgc_last_cfgdir_modtime" ]]; then
+          _wgc_last_cfgdir_modtime=$modtime
+          local -a c=( /usr/bin/find "${WGC_CFGDIR:-/etc/wireguard}" -maxdepth 1 -name \*.conf -type f )
+          local -a files
+          files=($("${c[@]}" 2>/dev/null)) || files=($(sudo "${c[@]}" 2>/dev/null)) || return 1
+          local f
+          for f in "${files[@]}"; do
+            f=${f##*/}; f=${f%.*}
+            [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
+            v+="$f "
+          done
+          _wgc_last_cfgdir_list=$v
+        else
+          v=$_wgc_last_cfgdir_list
+        fi
+        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
+        ;;
+      d|do|dow|down|s|st|sta|stat|state)
+        # Active VPNs in default namespace
+        local -a ifaces
+        ifaces=($(wg show interfaces 2>/dev/null)) || ifaces=(sudo $(wg show interfaces 2>/dev/null)) || return 1
+        local i v
+        for i in "${ifaces[@]}"; do
+          [[ $i == wgc_* ]] || continue
+          v+="${i#*wgc_} "
+        done
+        # Active VPNs (namespaces)
+        local n
+        while read -r n _; do
+          [[ $n == wgc_* ]] || continue
+          v+="${n#*wgc_} "
+        done < <(/usr/sbin/ip netns list 2>/dev/null)
+        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
+        ;;
+      e|ex|exe|exec)
+        # Active VPNs (namespaces)
+        local n v
+        while read -r n _; do
+          [[ $n == wgc_* ]] || continue
+          v+="${n#*wgc_} "
+        done < <(/usr/sbin/ip netns list 2>/dev/null)
+        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
+        ;;
+    esac
+    return 0
+  fi
+
+  # For exec, after VPN name do complete with system commmands
+  if [[ $COMP_CWORD -gt 2 ]]; then
+    case "${COMP_WORDS[1]}" in
+      e|ex|exe|exec)
+        if declare -F _command_offset &>/dev/null; then
+          # Use advanced completion if available
+          _command_offset 3
+        else
+          # Fallback to basic completion
+          if [[ $COMP_CWORD -eq 3 ]]; then
+            COMPREPLY=( $(compgen -c -- "$cur") )
+          else
+            compopt -o default
+            COMPREPLY=()
+          fi
+        fi
+        return 0
+        ;;
+    esac
+  fi
+}
+
+complete -F _wgc_completion wgc
+EOF
+
+  chmod 644 "$completion_file"
+
+  # Pre-populated cache (generated at install time)
+  local f
+  _wgc_last_cfgdir_list=
+  for f in $(find "$CFGDIR" -maxdepth 1 -name \*.conf -type f); do
+    f=${f##*/}; f=${f%.*}
+    [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
+    _wgc_last_cfgdir_list+="$f "
+  done
+  _wgc_last_cfgdir_modtime=$(stat -c %y "$CFGDIR" 2>/dev/null)
+  printf "%s\n" \
+    "_wgc_last_cfgdir_list=${_wgc_last_cfgdir_list@Q}" \
+    "_wgc_last_cfgdir_modtime=${_wgc_last_cfgdir_modtime@Q}" >> "$completion_file"
+
+  [[ $(stat -c %A "$CFGDIR") == *r?x ]] || \
+    warn "Completion for non-root users will use sudo to access configuration directory
+          whenever its modification time changes.
+          To avoid sudo consider: chmod o+rX '$CFGDIR' # directory only!
+          Otherwise add line for find command in sudoers as explained below.%%" fatal
+
+  cat << EOF
+$Y Bash completion installed to $completion_file
+
+To activate completion in current shell:
+  source $completion_file
+
+Completion will be automatically available in new shell sessions.
+
+To avoid sudo password prompt:
+  sudo visudo -f /etc/sudoers.d/wgc-completion
+  Then add:
+  %sudo ALL=(ALL) NOPASSWD: /usr/bin/find $CFGDIR -maxdepth 1 -name *.conf -type f
+EOF
+}
+
+has_openresolv() {
+  [[ $(resolvconf -h 2>/dev/null) =~ -x[[:blank:]][[:blank:].A-Za-z]*[[:blank:]]exclusive ]]
+}
+
+install_forced_openresolv() {
+  has_openresolv && error "Openresolv is already installed ('resolvconf' supports exclusive mode -x)." fatal
+
+  [[ -L /usr/sbin/resolvconf ]] ||
+    error "Systemd-resolved symlink wrapper for 'resolvconf' NOT detected. Standard installation is possible.
+           Please install 'openresolv' using: sudo apt-get install openresolv" fatal
+
+  echo "Forcing openresolv installation..."
+
+  dpkg-divert --list | grep "/usr/sbin/resolvconf" > /dev/null || {
+    echo "Diversion of resolvconf binary..."
+    dpkg-divert --divert /usr/sbin/resolvconf.systemd --rename --add /usr/sbin/resolvconf
+  }
+
+  local TEMP_DIR=$(mktemp -d)
+  mkdir -p "$TEMP_DIR"
+  cd "$TEMP_DIR" || return 1
+
+  apt-get download openresolv 2>/dev/null
+  local DEB_FILE=$(find . -name "openresolv*.deb" | head -n 1)
+  if [[ $DEB_FILE ]]; then
+    echo "Download via APT successful."
+  else
+    echo "APT download failed (package 'openresolv' likely missing)."
+    echo "Attempting download via Debian Unstable Packages index..."
+    local IDX_URL="https://ftp.debian.org/debian/dists/stable/main/binary-all/Packages.gz"
+    local REL_PATH=$(curl -s "$IDX_URL" | \
+          zgrep -m 1 "^Filename: .*openresolv_.*_all.deb" | cut -d ' ' -f 2)
+    if [[ -z $REL_PATH ]]; then
+      echo "Error: Could not find openresolv in Debian index."
+      echo "Tried searching: $IDX_URL"
+      echo "This may indicate the package has been removed or renamed."
+      cd .. && rm -rf "$TEMP_DIR"
+      return 1
+    fi
+    local FULL_URL="https://ftp.debian.org/debian/$REL_PATH"
+    DEB_FILE=$(basename "$REL_PATH")
+    echo "Detected version: $DEB_FILE"
+    wget -O "$DEB_FILE" "$FULL_URL" || {
+      echo "Download failed: $FULL_URL"
+      cd .. && rm -rf "$TEMP_DIR"
+      return 1
+    }
+  fi
+
+  echo "Creating file manifest..."
+  mkdir -p /etc/wwggcc
+
+  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tf - | grep -v '/$' | sed 's|^./|/|' > /etc/wwggcc/openresolv.files
+
+  echo "Extracting directly to system..."
+  dpkg-deb --fsys-tarfile "$DEB_FILE" | tar --keep-directory-symlink --no-overwrite-dir -xC /
+
+  cd ..
+  rm -rf "$TEMP_DIR"
+
+  echo "Detecting DNS backend..."
+  if [[ -d /run/systemd/resolve ]]; then
+    echo "Systemd-resolved detected. Appending configuration."
+    if ! grep -q "name_servers=\"127.0.0.53\"" /etc/resolvconf.conf; then
+      {
+        echo ""
+        echo "# Added by wgc installer for systemd-resolved compatibility"
+        echo "name_servers=\"127.0.0.53\""
+        echo "resolv_conf_options=\"trust-ad\""
+      } >> /etc/resolvconf.conf
+    else
+      echo "Configuration already present. Skipping."
+    fi
+  else
+    echo "Systemd-resolved NOT detected. Leaving standard configuration."
+  fi
+
+  echo "Regenerating resolvconf..."
+  /sbin/resolvconf -u
+
+  if command -v mandb >/dev/null; then
+    echo "Updating the manual page index caches..."
+    mandb -pq
+  fi
+
+  echo "Openresolv forced successfully."
+  echo "Manifest saved to /etc/wwggcc/openresolv.files"
+  echo "To remove openresolv: wgc remopenresolv"
+}
+
+check_openresolv() {
+  if ! has_openresolv; then
+    local tailmsg='Please run: apt-get install openresolv'
+    [[ -d /run/systemd/resolve ]] && tailmsg="This system has systemd-resolved.
+      To bypass debian package conflict with openresolv run 'wgc openresolv' instead of 'apt-get install openresolv'.
+      To remove openresolv installed by wgc run 'wgc remopenresolv'."
+    error "Your version of 'resolvconf' does not support exclusive mode (-x).
+           $tailmsg" fatal blameparent
+  fi
+}
+
+remove_openresolv() {
+  local MANIFEST=/etc/wwggcc/openresolv.files
+
+  echo "Removing openresolv..."
+
+  dpkg-divert --list | grep "/usr/sbin/resolvconf" > /dev/null ||
+    error "No package diversion found. Assuming standard APT management.
+           To uninstall 'openresolv', please use: sudo apt remove openresolv" fatal
+
+  echo "Removing diversion of resolvconf binary..."
+  rm -f /usr/sbin/resolvconf
+  dpkg-divert --rename --remove /usr/sbin/resolvconf
+
+  if [[ -f "$MANIFEST" ]]; then
+    echo "Deleting installed files..."
+    cat "$MANIFEST" | tr '\n' '\0' | xargs -0 rm -f
+    rm -f "$MANIFEST"
+  else
+    echo "Warning: Manifest $MANIFEST not found. Trying generic cleanup..."
+    rm -f /usr/sbin/resolvconf
+    rm -rf /usr/lib/resolvconf
+    rm -f /etc/resolvconf.conf
+  fi
+
+  rmdir /usr/lib/resolvconf 2>/dev/null || true
+
+  echo "Restoring systemd-resolved symlink /etc/resolv.conf..."
+  if [[ -f /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
+    rm -f /etc/resolv.conf
+    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+  fi
+
+  echo "Restoring systemd-resolved resolvconf symlink wrapper..."
+  rm -f /usr/sbin/resolvconf
+  ln -sf /usr/bin/resolvectl /usr/sbin/resolvconf
+
+  if command -v mandb >/dev/null; then
+    echo "Updating the manual page index caches..."
+    mandb -pq
+  fi
+
+  echo "Done. System returned to APT management."
+}
+
+has_namespace() {
+  [[ -f /run/netns/$NAMESPACE || -f /var/run/netns/$NAMESPACE ]]
+}
+
+is_connected() {
+  HAS_NAMESPACE= IN_NAMESPACE=
+
+  has_namespace && HAS_NAMESPACE=$NAMESPACE
+  if ip -br link show $DEV &>/dev/null; then
+    return 0
+  fi
+  [[ $HAS_NAMESPACE ]] || return 1
+  ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null || return 1
+  IN_NAMESPACE=$NAMESPACE
+  return 0
+}
+
+validate_ipv4_kern() {
+  local ip=$1
+  ip -4 rule add to "$ip" &>/dev/null || return 1
+  ip -4 rule del to "$ip" &>/dev/null || true
+}
+
+validate_ipv4() {
+  # Define a single octet
+  # 25[0-5]     -> 250-255
+  # 2[0-4][0-9] -> 200-249
+  # 1[0-9][0-9] -> 100-199
+  # [1-9]?[0-9] -> 0-99
+  local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+  local regex="^$oct\.$oct\.$oct\.$oct$"
+  [[ $1 =~ $regex ]]
 }
 
 validate_vpn_name() {
