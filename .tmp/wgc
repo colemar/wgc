@@ -57,7 +57,9 @@ doit() {
   set -o pipefail    # Return value of a pipeline is the status of the last command to exit with a non-zero status.
   set -o errexit   # Exit immediately if a command exits with a non-zero status.
   set -o errtrace  # Trap ERR is inherited by functions.
-  trap 'error TRAP fatal' ERR
+  trap 'error TRAP-ERR fatal' ERR
+  trap 'error TRAP-INT fatal' INT
+  trap 'error TRAP-TERM fatal' TERM
   shopt -s extglob   # Enable extended glob patterns: x(y)
   shopt -s nullglob  # Patterns which match no files expand to a null string
   shopt -s checkwinsize extquote
@@ -943,13 +945,14 @@ parse_config_file() {
   eval "$(get_params "$@")"
 
   local fatal=fatal; [[ $p_relax ]] && fatal=
-
   [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
   [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
+
   local line= n=0 s=0 section= key= value= ISSUES= section_valid=
   Address= PrivateKey= PublicKey= Endpoint= AllowedIPs= DNS= MTU= ListenPort= FwMark= PersistentKeepalive= PresharedKey=
   WGC_BRIDGES=()
   local -A SEEN_SECTIONS=() USED_BRPORTS=() USED_BRNAMES=()
+  fatal=
   while read -r line || [[ $line ]]; do # also read last line if \n is missing
       ((++n))
       line=${line%%#*} # Remove comments
@@ -991,19 +994,36 @@ parse_config_file() {
         continue
       fi
       # Get values according to section/key
-      process_config_line || true
+      process_config_line || fatal=fatal
   done < "$config_file"
+  validate_parameters || fatal=fatal
   if [[ ! $p_relax ]]; then
     for n in Address PrivateKey PublicKey Endpoint AllowedIPs; do
-      [[ ${!n} ]] || \
-        if [[ $p_report ]]; then
-          ISSUES+=$'\n'"Missing required key '$n'"
-        else
-          error "Missing required key '$n' in file $config_file" fatal blameparent
-        fi
+      [[ ${!n} ]] || { fatal=fatal; ISSUES+=$'\n'"Missing required key '$n'"; }
     done
-    [[ $ISSUES ]] && warn "Issues in $config_file:$ISSUES" || true
+    if [[ $ISSUES ]]; then
+      [[ $p_report ]] && fatal=
+      error "Issues in $config_file:$ISSUES" $fatal blameparent
+    fi
   fi
+}
+
+validate_parameters() {
+  local p v n fatal= k
+  for p in "${!PARAMETER_VAL[@]}"; do
+    v=${PARAMETER_VAL[$p]}; n=${PARAMETER_LINE[$p]}
+    case "$p" in
+      Address)
+        extract_all_val "$v" Address
+        for k in "${Address[@]}"; do
+          XXX
+        done
+        if ! validate_ipv4_cidr "$v"; then
+          ISSUES+=$'\n'"Invalid Address at line $n"
+          fatal=1
+        fi ;;
+    esac
+  done
 }
 
 process_config_line() {
@@ -1030,20 +1050,7 @@ process_config_line() {
       case "$key" in
         _checksection_) return 0 ;;
         AllowedIPs) extract_all_ipv4 "cidr$value" ' ' AllowedIPs ;;
-        Endpoint)
-          if [[ ! $Endpoint =~ ([-A-Za-z0-9.]+):([0-9]+) ]]; then
-            ISSUES+=$'\n'"Invalid Endpoint value '$Endpoint' at line $n"
-            return 1
-          fi
-          Endpoint=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
-          if ! is_valid_port "$port"; then
-            ISSUES+=$'\n'"Invalid port '$ep_port' in Endpoint at line $n"
-            return 1
-          fi
-          validate_ipv4 "$Endpoint" || read -r Endpoint _ < <(getent ahostsv4 "$ep_host") || \
-          XXX
-
-          Endpoint=$value ;;
+        Endpoint) validate_resolve_endpoint || return 1 ;;
         PersistentKeepalive) PersistentKeepalive=$value ;;
         PresharedKey) PresharedKey=$value ;;
         PublicKey) PublicKey=$value ;;
@@ -1087,9 +1094,42 @@ process_config_line() {
   return 0
 }
 
+validate_resolve_endpoint() {
+  if [[ ! $Endpoint =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]]; then
+    ISSUES+=$'\n'"Invalid Endpoint value '$Endpoint' at line $n"
+    return 1
+  fi
+  local host=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
+  if ! is_valid_port "$port"; then
+    ISSUES+=$'\n'"Invalid port '$port' in Endpoint at line $n"
+    return 1
+  fi
+  validate_ipv4 "$host" || \
+    read -r Endpoint _ < <(getent ahostsv4 "$host") || {
+      ISSUES+=$'\n'"Cannot resolve Endpoint host '$host' at line $n"
+      return 1
+    }
+}
+
 is_valid_port() {
   local p=$1
   [[ $p =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535))
+}
+
+# local -a ARRAY
+# extract_all_val ' one, two  three , four , ' ARRAY
+# declare -p ARRAY # declare -a ARRAY=([0]="one" [1]="two" [2]="three" [3]="four")
+extract_all_val() {
+  local -n _a=$2
+  local IFS=$' \t\n'
+  _a=( ${1//,/ } )
+}
+
+# Like extract_all_val, but appends
+append_all_val() {
+  local -n _a=$2
+  local IFS=$' \t\n'
+  _a+=( ${1//,/ } )
 }
 
 extract_ipv4() { # Appends to ${!2}
@@ -1557,6 +1597,14 @@ validate_ipv4() {
   [[ $1 =~ $regex ]]
 }
 
+validate_ipv4_cidr() {
+  # [1-2]?[0-9] -> 0-29
+  # 3[012]      -> 30-32
+  local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+  local regex="^$oct\.$oct\.$oct\.$oct(/([1-2]?[0-9]|3[012]))?$"
+  [[ $1 =~ $regex ]]
+}
+
 validate_vpn_name() {
   [[ $VPN =~ ^[a-zA-Z0-9_-]{1,11}$ ]] || \
     error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max lenght is 11." fatal blameparent
@@ -1599,8 +1647,8 @@ error() {
   local p_fatal= p_blameparent=
   eval "$(get_params "$@")"
 
-  local original_trap=$(trap -p ERR) original_opts=$-
-  trap - ERR; set +e
+  local original_traps=$(trap -p) original_opts=$-
+  trap - ERR INT TERM; set +e
 
   local line=${BASH_LINENO[0]}
 
@@ -1609,9 +1657,15 @@ error() {
   case "$msg" in
     "")
       ;;
-    TRAP)
+    TRAP-ERR)
       echo "${X}ERROR @$line: Command '$BASH_COMMAND' failed with exit code $exit_code" >&2
       show_traceback >&2
+      ;;
+    TRAP-INT)
+      echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&
+      ;;
+    TRAP-TERM)
+      echo "${W} Terminated by signal (SIGTERM) @$line while executing '$BASH_COMMAND'" >&2
       ;;
     *)
       indent_multiline msg
@@ -1635,7 +1689,7 @@ error() {
     exit 1
   fi
 
-  [[ $original_trap ]] && eval "$original_trap"
+  [[ $original_traps ]] && eval "$original_traps"
   [[ $original_opts == *e* ]] && set -e
   return 0 # allow to use error() as soft error handler without adding ||true to avoid trap ERR and recursion
 }
