@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 #
 # wgc - Manage multiple WireGuard VPNs using Linux network namespaces.
 # Copyright (C) 2025 Marco Coletti <colemarc@gmail.com>.
@@ -21,10 +21,6 @@
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
 doit() {
-  # Set safe/trusted PATH
-  local ORIG_PATH=$PATH
-  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
   if [ -z "$BASH_VERSION" ]; then
     echo "ERROR: This script requires Bash. Please run with 'wgc'." >&2
     exit 1
@@ -35,13 +31,16 @@ doit() {
   fi
 
   # Sanitized auto-elevation
+  local safesudo
+  safesudo=$(command -p -v sudo) || { echo "ERROR: sudo not found in standard paths." >&2; exit 1; }
   if [[ ! $UID == 0 ]]; then
-    PATH=$ORIG_PATH # restore original PATH because exec_in_namespace() recovers it
-    exec sudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
+    exec $safesudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
   fi
   # unset fails when readonly, so use exec env -i
   [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
     exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
+
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
   set +vx
   [[ ${1:-} == trace ]] && { set -vx; shift; }
@@ -343,6 +342,8 @@ start_vpn() {
   # get parameters and forwarding bridges from config file named $VPN
   parse_config_file $VPN ${p_nup:+bridges}
 
+  # TODO: call compute_mtu
+
   push_cleanup clean_vpn
 
   # Create WireGuard interface
@@ -414,7 +415,7 @@ configure_vpn_plain() {
     # Configure DNS
     local k= q=
     for k in $DNS; do
-      if validate_ipv4 "$k"; then
+      if is_valid_ipv4 "$k"; then
         q+="nameserver $k"$'\n'
         [[ $CMD == bupd ]] && ip route add "$k" dev "$DEV" 2>/dev/null || true
       else
@@ -439,7 +440,7 @@ set_override_default_route() {
 set_endpoint_host_route() {
   local ep=${Endpoint%%:*} route
   local -a route_args
-  validate_ipv4 "$ep" || read -r ep _ < <(getent ahostsv4 "$ep") || \
+  is_valid_ipv4 "$ep" || read -r ep _ < <(getent ahostsv4 "$ep") || \
     error "Cannot resolve Endpoint name '$ep'" fatal blameparent
   route=$(ip -j route get "$ep" 2>/dev/null) || error "Cannot find route to Endpoint $ep" fatal blameparent
   [[ $route =~ \"gateway\":\"([^\"]+)\" ]] && route_args+=(via "${BASH_REMATCH[1]}")
@@ -475,6 +476,15 @@ del_source_routing() {
     ip rule del from ${BASH_REMATCH[0]} &>/dev/null || true
 }
 
+compute_mtu() {
+  [[ ${PARAMETER_VAL[MTU]:-} ]] && return
+  local m endpoint=${PARAMETER_VAL[Endpoint]}
+  local r=$(ip route get "${endpoint%%:*}" 2>&- || ip route show default 2>&-)
+  [[ $r =~ mtu\ ([0-9]+) ]] && m=${BASH_REMATCH[1]}
+  [[ ! $m && $r =~ dev\ ([^ ]+) ]] && m=$(<"/sys/class/net/${BASH_REMATCH[1]}/mtu") 2>&-
+  PARAMETER_VAL[MTU]=$(( ${m:-1500} - 80 ))
+}
+
 configure_vpn_in_namespace() {
 
   # Create and configure namespace
@@ -493,7 +503,7 @@ configure_vpn_in_namespace() {
   if mkdir -p /etc/netns/$NAMESPACE; then
     local k
     for k in $DNS; do
-      if validate_ipv4 "$k"; then
+      if is_valid_ipv4 "$k"; then
         echo "nameserver $k"
       else
         warn "Skipping invalid DNS server '$k'"
@@ -917,7 +927,7 @@ show_config() {
     [[ $k == PrivateKey && ${!k} ]] && val="<HIDDEN>"
     prc "+c%-20s+Y${!k:++/}%s+/" $k "$val"
     if [[ $k ==  P*Key && ${!k} ]]; then
-      if pub=$(wg pubkey <<<${!k} 2>/dev/null); then
+      if pub=$(get_public_key "${!k}"); then
         [[ $k == PrivateKey ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
       else
         prc " $W +R%s+/ " invalid
@@ -1008,24 +1018,6 @@ parse_config_file() {
   fi
 }
 
-validate_parameters() {
-  local p v n fatal= k
-  for p in "${!PARAMETER_VAL[@]}"; do
-    v=${PARAMETER_VAL[$p]}; n=${PARAMETER_LINE[$p]}
-    case "$p" in
-      Address)
-        extract_all_val "$v" Address
-        for k in "${Address[@]}"; do
-          XXX
-        done
-        if ! validate_ipv4_cidr "$v"; then
-          ISSUES+=$'\n'"Invalid Address at line $n"
-          fatal=1
-        fi ;;
-    esac
-  done
-}
-
 process_config_line() {
   [[ ${1:-} == checksection ]] && key=_checksection_
   case "$section" in
@@ -1094,21 +1086,84 @@ process_config_line() {
   return 0
 }
 
+validate_parameters() {
+  local p v n k
+  local -A REQUIRED_PARAMETERS=( [Address]=1 [PrivateKey]=1 [PublicKey]=1 [Endpoint]=1 [AllowedIPs]=1 )
+  for p in "${!PARAMETER_VAL[@]}"; do
+    v=${PARAMETER_VAL[$p]}; n=${PARAMETER_LINE[$p]}
+    case "$p" in
+      Address)
+        unset REQUIRED_PARAMETERS[$p]
+        k=$(collect_all_ipv4_cidr "$v" Address) || ISSUES+=$'\n'"Ignoring $k bad tokens in Address at line $n"
+        (( ${#Address[@]} > 0 )) || ISSUES+=$'\n'"FATAL: Could not find any CIDR IPv4 in Address at line $n"
+        ;;
+      DNS)
+        k=$(collect_all_ipv4 "$v" DNS) || ISSUES+=$'\n'"Ignoring $k bad tokens in DNS at line $n"
+        (( ${#DNS[@]} > 0 )) && continue
+        unset PARAMETER_VAL[$p]
+        ISSUES+=$'\n'"Could not find any IPv4 in DNS at line $n"
+        ;;
+      MTU)
+        [[ $v =~ ^[0-9]+$ ]] && ((v >= 576 && v <= 65535)) && continue
+        unset PARAMETER_VAL[$p] # to trigger auto calculation
+        ISSUES+=$'\n'"Invalid MTU value at line $n (must be 576-65535): $v"
+        ISSUES+=$'\n'"  Falling back to auto-calculated MTU based on endpoint route."
+        ;;
+      PrivateKey)
+        unset REQUIRED_PARAMETERS[$p]
+        is_valid_key "$v" && continue
+        ISSUES+=$'\n'"FATAL: Invalid PrivateKey value at line $n"
+        ;;
+      ListenPort)
+        is_valid_port "$v" && continue
+        unset PARAMETER_VAL[$p]
+        ISSUES+=$'\n'"Ignoring invalid ListenPort value at line $n (must be 1-65535): $v"
+        ;;
+      FwMark)
+        is_valid_fwmark "$v" && continue
+        unset PARAMETER_VAL[$p]
+        ISSUES+=$'\n'"Ignoring invalid FwMark value at line $n (must be 0-4294967295 0x0-0xFFFFFFFF): $v"
+        ;;
+      AllowedIPs)
+        unset REQUIRED_PARAMETERS[$p]
+        k=$(collect_all_ipv4_cidr "$v" AllowedIPs) || ISSUES+=$'\n'"Ignoring $k bad tokens in AllowedIPs at line $n"
+        (( ${#AllowedIPs[@]}> 0 )) || ISSUES+=$'\n'"FATAL: Could not find any CIDR IPv4 in AllowedIPs at line $n"
+        ;;
+      Endpoint)
+        unset REQUIRED_PARAMETERS[$p]
+        k=$(validate_resolve_endpoint "$v") && continue
+        ISSUES+=$'\n'"FATAL: $k at line $n"
+        ;;
+      # XXX to be continued
+Errore Fatale: Scope nelle Subshell
+La funzione collect_all_ipv4_cidr viene eseguita in un processo figlio: le modifiche all'array vengono perse.
+Soluzione: Non usare $(...) per funzioni che devono modificare variabili "by reference" (nameref). Devi passare una terza variabile per raccogliere il numero di errori.
+
+- PARAMETER_VAL[$p] contiene il valore del  parametro $p trovato nel file config.
+- PARAMETER_LINE[$p] contiene il numero di riga dove è stato trovato il parametro $p.
+- Se alla fine REQUIRED_PARAMETERS contiene ancora qualche chiave, sarà aggiunta a ISSUES una riga che comincia con "FATAL:" che elenca le chiavi rimaste in quanto non trovate in PARAMETER_VAL e quindi assenti dal file di configurazione.
+- Se alla fine ISSUES contiene "FATAL:", sarà segnalato errore fatale mostrando il contenuto di ISSUES.
+- Ogni parametro che fallisce non-fatal la validazione deve essere tolto da PARAMETER_VAL, in modo che più avanti non sarà utilizzato oppure sarà calcolato.
+- Ogni parametro che fallisce fatal la validazione non ha bisogno di essere tolto in quando il "FATAL:" in ISSUES terminerà wgc con errore (come sopra).
+
+    esac
+  done
+}
+
 validate_resolve_endpoint() {
-  if [[ ! $Endpoint =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]]; then
-    ISSUES+=$'\n'"Invalid Endpoint value '$Endpoint' at line $n"
+  if [[ ! $1 =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]]; then
+    echo "Invalid Endpoint value '$1'"
     return 1
   fi
   local host=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
   if ! is_valid_port "$port"; then
-    ISSUES+=$'\n'"Invalid port '$port' in Endpoint at line $n"
+    echo "Invalid port '$port' in Endpoint"
     return 1
   fi
-  validate_ipv4 "$host" || \
-    read -r Endpoint _ < <(getent ahostsv4 "$host") || {
-      ISSUES+=$'\n'"Cannot resolve Endpoint host '$host' at line $n"
-      return 1
-    }
+  is_valid_ipv4 "$host" || getent ahostsv4 "$host" &>&- || {
+    echo "Could not resolve Endpoint host '$host'"
+    return 1
+  }
 }
 
 is_valid_port() {
@@ -1119,17 +1174,63 @@ is_valid_port() {
 # local -a ARRAY
 # extract_all_val ' one, two  three , four , ' ARRAY
 # declare -p ARRAY # declare -a ARRAY=([0]="one" [1]="two" [2]="three" [3]="four")
-extract_all_val() {
+collect_all_val() {
   local -n _a=$2
   local IFS=$' \t\n'
   _a=( ${1//,/ } )
 }
 
-# Like extract_all_val, but appends
-append_all_val() {
+collect_all_ipv4() {
   local -n _a=$2
-  local IFS=$' \t\n'
-  _a+=( ${1//,/ } )
+  local ip bad=0
+  local -; set -f # disable globbing only in this scope
+  for ip in ${1//,/ }; do
+    is_valid_ipv4 "$ip" && _a+=( "$ip" ) || ((bad++))
+  done
+  echo $bad
+  return $((bad>0))
+}
+
+collect_all_ipv4_cidr() {
+  local -n _a=$2
+  local ip bad=0
+  local -; set -f # disable globbing only in this scope
+  for ip in ${1//,/ }; do
+    is_valid_ipv4_cidr "$ip" && _a+=( "$ip" ) || ((bad++))
+  done
+  echo $bad
+  return $((bad>0))
+}
+
+is_valid_ipv4() {
+  # Define a single octet
+  # 25[0-5]     -> 250-255
+  # 2[0-4][0-9] -> 200-249
+  # 1[0-9][0-9] -> 100-199
+  # [1-9]?[0-9] -> 0-99
+  local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+  local regex="^$oct\.$oct\.$oct\.$oct$"
+  [[ $1 =~ $regex ]]
+}
+
+is_valid_ipv4_cidr() {
+  # [1-2]?[0-9] -> 0-29
+  # 3[012]      -> 30-32
+  local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+  local regex="^$oct\.$oct\.$oct\.$oct(/([1-2]?[0-9]|3[012]))?$"
+  [[ $1 =~ $regex ]]
+}
+
+is_valid_key() {
+  [[ $1 =~ ^[a-zA-Z0-9+/]{43}=$ ]] && wg pubkey <<< "$1" &>/dev/null
+}
+
+get_public_key() {
+  [[ $1 =~ ^[a-zA-Z0-9+/]{43}=$ ]] && wg pubkey <<< "$1" 2>/dev/null
+}
+
+is_valid_fwmark() {
+  [[ $1 == off || $1 =~ ^(0x[[:xdigit:]]+|0|[1-9][0-9]*)$ && $1 -le 4294967295 ]]
 }
 
 extract_ipv4() { # Appends to ${!2}
@@ -1147,7 +1248,7 @@ extract_all_ipv4() {
   [[ "$_in" == cidr* ]] && _regex+='(/[0-9]+)?'
   while [[ $_in =~ $_regex ]]; do
     match=${BASH_REMATCH[0]}
-    if is_valid_ip4 "$match"; then
+    if is_real_ipv4 "$match"; then
       _out+=$_sep$match
     else
       ISSUES+=$'\n'"Ignored invalid IPv4 value at line $n: '$match' (octets must be 0-255, prefix 0-32)"
@@ -1158,7 +1259,7 @@ extract_all_ipv4() {
   _out=${_out#$_sep} # Remove initial separator if present
 }
 
-is_valid_ipv4() {
+is_real_ipv4() {
   local IFS=./ n1 n2 n3 n4 prefix
   read -r n1 n2 n3 n4 prefix <<< "$1"
   (( 10#$n1 <= 255 && 10#$n2 <= 255 && 10#$n3 <= 255 && 10#$n4 <= 255 )) || return 1
@@ -1578,31 +1679,6 @@ is_connected() {
   ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null || return 1
   IN_NAMESPACE=$NAMESPACE
   return 0
-}
-
-validate_ipv4_kern() {
-  local ip=$1
-  ip -4 rule add to "$ip" &>/dev/null || return 1
-  ip -4 rule del to "$ip" &>/dev/null || true
-}
-
-validate_ipv4() {
-  # Define a single octet
-  # 25[0-5]     -> 250-255
-  # 2[0-4][0-9] -> 200-249
-  # 1[0-9][0-9] -> 100-199
-  # [1-9]?[0-9] -> 0-99
-  local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
-  local regex="^$oct\.$oct\.$oct\.$oct$"
-  [[ $1 =~ $regex ]]
-}
-
-validate_ipv4_cidr() {
-  # [1-2]?[0-9] -> 0-29
-  # 3[012]      -> 30-32
-  local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
-  local regex="^$oct\.$oct\.$oct\.$oct(/([1-2]?[0-9]|3[012]))?$"
-  [[ $1 =~ $regex ]]
 }
 
 validate_vpn_name() {
