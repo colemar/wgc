@@ -327,15 +327,20 @@ prc() {
 set_cfgdir() {
   CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
   # Validate directory
-  [[ ! -d "$CFGDIR" ]] && \
-    error "Configuration directory not found: $CFGDIR
-          Set WGC_CFGDIR to point to dir containing Wireguard *.conf files." fatal
-  if ! ls "$CFGDIR" &>/dev/null; then
+  [[ $CFGDIR == /* ]] || error "WGC_CFGDIR must be an absolute path" fatal
+  [[ -d "$CFGDIR" ]] || error "Directory '$CFGDIR' not found. Check WGC_CFGDIR." fatal
+  local status=$(stat -c '%U%A' "$CFGDIR" 2>/dev/null)
+  [[ $status ]] || error "Could not read status of directory '$CFGDIR'. Access to metadata denied or restricted." fatal
+  [[ $status == rootd* ]] || error "Security: $CFGDIR must be a root-owned directory." fatal
+  [[ ${status:9:1} == w || ${status:12:1} == w ]] && \
+    error "Security: '$CFGDIR' is writable by non-root users (perms: ${status:4}). Revoke 'w' bits." fatal
+  ls "$CFGDIR" &>/dev/null || \
     error "Cannot access configuration directory: $CFGDIR
            Possible causes: SELinux, AppArmor, or mount restrictions.
            Debug: sudo ls -ldZ '$CFGDIR' && sudo getenforce" fatal
-  fi
-  return 0
+  [[ -f "$CFGDIR/wgc_enable" ]] || error "Security: Approval file 'wgc_enable' missing in $CFGDIR. Root must create it." fatal
+  [[ ${status:11:1} == r ]] || \
+    warn "Add 'r' bit for others to '$CFGDIR' (chmod o+r, current perms: ${status:4}) to enable command completion without sudo prompt."
 }
 
 start_vpn() {
@@ -498,7 +503,7 @@ compute_mtu() {
   local r=$(ip route get "$ep" 2>&- || ip route show default 2>&-)
   [[ $r =~ mtu\ ([0-9]+) ]] && m=${BASH_REMATCH[1]}
   [[ ! $m && $r =~ dev\ ([^ ]+) ]] && m=$(<"/sys/class/net/${BASH_REMATCH[1]}/mtu") 2>&-
-  PARAM_VAL[[Interface]:MTU]=$(( ${m:-1500} - 80 ))
+  PARAM_VAL[[Interface]:MTU]=$(( ${m:-1500} - 60 )) # -80 if IPv6
 }
 
 configure_vpn_in_namespace() {
@@ -930,9 +935,10 @@ list_config_files() {
 
 show_config_file() {
   local -r config_file="$CFGDIR/$VPN.conf"
-  [[ -f $config_file ]] || error "Not a file: $config_file"
-  [[ -r $config_file ]] || error "Cannot read file: $config_file"
-  printf %s\\n "$(< $config_file)"
+  [[ -f $config_file ]] || error "File not found: $config_file" fatal
+  [[ -L $config_file ]] && error "Security: Symlinks are not allowed: $config_file" fatal
+  [[ -r $config_file ]] || error "Cannot read file: $config_file" fatal
+  sed -E 's/^([[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*).*/\1<HIDDEN>/' "$config_file"
 }
 
 show_parsed_config_file() {
@@ -980,8 +986,9 @@ parse_config_file() {
   eval "$(get_params "$@")"
 
   local fatal=fatal; [[ $p_relax ]] && fatal=
-  [[ -f "$config_file" ]] || { error "Config file not found: $config_file" $fatal blameparent; return 1; }
-  [[ -r "$config_file" ]] || { error "Can't read file: $config_file" $fatal blameparent; return 1; }
+  [[ -f "$config_file" ]] || { error "File not found: $config_file" $fatal blameparent; return 1; }
+  [[ -L $config_file ]] && { error "Security: Symlinks are not allowed: $config_file" $fatal blameparent; return 1; }
+  [[ -r "$config_file" ]] || { error "Cannot read file: $config_file" $fatal blameparent; return 1; }
 
   local line n=0 section= key value
   local -A SEEN_SECTIONS=()
