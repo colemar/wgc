@@ -76,6 +76,11 @@ doit() {
   local CFGDIR; set_cfgdir; readonly CFGDIR
   local HAS_NAMESPACE IN_NAMESPACE
   local -A PARAM_VAL PARAM_LNO BRIDGES
+  mapfile -t PARAMS < <( printf "[Interface]:%s\n" Address DNS MTU ListenPort FwMark PrivateKey
+                         printf "[Peer]:%s\n" PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive )
+  local -A REQUIRED_PARAMS=( [[Interface]:Address]=1 [[Interface]:PrivateKey]=1 \
+                            [[Peer]:PublicKey]=1 [[Peer]:Endpoint]=1 [[Peer]:AllowedIPs]=1 )
+  readonly PARAMS REQUIRED_PARAMS
 
   case "$CMD" in
     u|up|f|fu|fup|bup|bupd|n|nu|nup|d|do|dow|down|s|st|sta|stat|state|e|ex|exe|exec)
@@ -155,15 +160,16 @@ Core Commands:
                for 0.0.0.0/0 to prevent loops.  Effect: Automatically handles
                Split Tunnel or Full Tunnel based on configuration file.
   fup <vpn>  - Start VPN in Full Tunnel mode (Redirect All Traffic).
-               Ignores AllowedIPs routing logic and directs ALL traffic through
-               the VPN tunnel. Useful for untrusted networks/public Wi-Fi.
+               Directs ALL traffic through the VPN tunnel.
+               Useful for untrusted networks/public Wi-Fi.
+               Equivalent to 'up' command with AllowedIPs=0.0.0.0/0.
   bup <vpn>  - Start VPN in Bind-Only mode.
                VPN is accessible, but no traffic is routed automatically because
                neither system routing tables nor DNS settings are modified.
                Traffic enters the tunnel if and only if it is explicitly bound
                to the VPN interface or its IP address.
   bupd <vpn> - Start VPN in Bind-Only mode with DNS.
-               Just like bup, but enforces VPN DNS settings system-wide.
+               Like 'bup', but enforces VPN DNS settings system-wide like 'up' does.
                Routes are added only for the nameservers to ensure reachability.
                Data traffic still requires explicit binding, but DNS resolution
                is performed via the VPN tunnel for the entire system.
@@ -457,10 +463,10 @@ del_endpoint_host_route() {
 
 set_source_routing() {
   local -i t
-  for ((t=51820; t<65536; t++))
+  for ((t=51820; t<52000; t++))
     [[ $(ip route show table $t 2>/dev/null) ]] || break
   done
-  ((t > 65535)) && error "Could not find an empty routing table in the range 51820..65535" fatal
+  ((t > 51999)) && error "Could not find an empty routing table in the range 51820..51999" fatal
   ip route add default dev $DEV table $t
   local addr IFS=,
   for addr in ${PARAM_VAL[[Interface]:Address]}; do
@@ -469,16 +475,22 @@ set_source_routing() {
 }
 
 del_source_routing() {
-  local t json regex='"dst":"default","table":"([56][0-9]{4})"'
-  json=$(ip -j route show dev "$DEV" table all 2>/dev/null) || return 0
-  [[ $json =~ $regex ]] && t=${BASH_REMATCH[1]} || return 0
-  (( 51820 <= t && t <= 65535 )) || return 0
+  local t json regex
+  t=$(find_source_routing_table) || return 0
   json=$(ip -j -br addr show "$DEV" 2>/dev/null) || return 0
   regex='"local":"(([0-9]{1,3}\.){3}[0-9]{1,3})"'
   while [[ $json =~ $regex ]]; do
     ip rule del from "${BASH_REMATCH[1]}" table $t &>/dev/null || true
     json="${json#*"${BASH_REMATCH[0]}"}"
   done
+}
+
+find_source_routing_table() {
+  local t json regex='"dst":"default","table":"(51[89][0-9]{2})"'
+  json=$(ip -j route show dev "$DEV" table all 2>/dev/null) || return 1
+  [[ $json =~ $regex ]] && t=${BASH_REMATCH[1]} || return 1
+  (( 51820 <= t && t <= 51999 )) || return 1
+  printf %s $t
 }
 
 compute_mtu() {
@@ -497,8 +509,11 @@ configure_vpn_in_namespace() {
   ip netns exec $NAMESPACE ip link set lo up || error "Failed to bring up loopback interface in namespace '$NAMESPACE'" fatal
   # Configure interface $DEV
   ip netns exec $NAMESPACE ip link set $DEV mtu $MTU || error "Failed to configure MTU '$MTU' for interface '$DEV'" fatal
-  ip netns exec $NAMESPACE ip addr add "$Address" dev $DEV || error "Failed to configure address '$Address' for interface '$DEV'" fatal
-  ip netns exec $NAMESPACE ip link set $DEV up || error "Failed to bring up interface '$DEV' with address '$Address'" fatal
+  local addr IFS=,
+  for addr in ${PARAM_VAL[[Interface]:Address]}; do
+    ip netns exec $NAMESPACE ip addr add "$addr" dev $DEV || error "Failed to configure address '$addr' for interface '$DEV'" fatal
+  done
+  ip netns exec $NAMESPACE ip link set $DEV up || error "Failed to bring up interface '$DEV'" fatal
 
   # Add default route
   ip netns exec $NAMESPACE ip route add default dev $DEV
@@ -782,20 +797,23 @@ show_state() {
       echo "  Example: wgc exec $VPN curl ipinfo.io"
     else
       echo "Routes:"
-      ip -c route show | grep -F --color $DEV || echo "  (none)"
+      ip -c route show table all | grep -F --color $DEV || echo "  (none)"
       echo
-      if [[ $(ip -br addr show $DEV 2>/dev/null) =~ ([0-9]{1,3}\.){3}[0-9]{1,3} ]]; then
-        local addr=${BASH_REMATCH[0]}
-        echo "Rules:"
-        ip rule list from $addr | grep -F --color "from $addr" || echo "  (none)"
-        local t=
-        while read -r _ _ _ _ t; do
-          echo
-          echo "Routing table $t:"
-          ip -c route show table $t
-        done < <(ip rule list from $addr)
+      local t json regex
+      if t=$(find_source_routing_table); then
+        if json=$(ip -j -br addr show "$DEV" 2>/dev/null); then
+          regex='"local":"(([0-9]{1,3}\.){3}[0-9]{1,3})"'
+          echo "Rules:"
+          while [[ $json =~ $regex ]]; do
+            ip rule list from "${BASH_REMATCH[1]}" table $t
+            json="${json#*"${BASH_REMATCH[0]}"}"
+          done | grep -F --color "from $addr" || echo "  (none)"
+          [[ ${BASH_REMATCH[1]} ]] || warn "Could not find $DEV ip address"
+        else
+          warn "Could not find $DEV ip address"
+        fi
       else
-        warn "Cannot find $DEV ip address"
+        warn "Could not find table used for source routing"
       fi
       echo
       echo "DNS:"
@@ -864,26 +882,27 @@ show_bridges() {
 }
 
 show_active_vpns() {
-  local x= ns= dev= net= found=
+  local s= ns= dev= addr= found=
   echo
   echo "Active VPNs in default namespace:"
-  for x in $(wg show interfaces); do
-    [[ $x == wgc_* ]] || continue
-    if read -r dev x net < <(ip -br -c address show $x 2>/dev/null); then
+  for dev in $(wg show interfaces); do
+    [[ $dev == wgc_* ]] || continue
+    if read -r dev s addr < <(ip -br -c address show $dev 2>/dev/null); then
       found=1
-      echo $dev $net
+      echo $dev $s $addr
     fi
   done
   [[ $found ]] || echo "  (none)"
   found=
   echo
   echo "Active VPNs in other namespaces:"
-  while read -r ns x; do
+  while read -r ns _; do
+    [[ $ns == wgc_* ]] || continue
     dev=$ns
     if ip netns exec $ns wg show $dev &>/dev/null && \
-    read -r dev x net < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null); then
+    read -r dev s addr < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null); then
       found=1
-      echo $dev $net
+      echo $dev $s $addr
     fi
   done < <(ip netns list 2>/dev/null)
   [[ $found ]] || echo "  (none)"
@@ -903,9 +922,9 @@ list_config_files() {
     parse_config_file "$g" bridges relax || continue
     Endpoint=${PARAM_VAL[[Peer]:Endpoint]}
     Address=${PARAM_VAL[[Interface]:Address]%%,*}
-    AllowedIPs=${PARAM_VAL[[Peer]:AllowedIPs]%%,*}
+    AllowedIPs=${PARAM_VAL[[Peer]:AllowedIPs]}
     (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
-    prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#WGC_BRIDGES[@]} "$Address" "$Endpoint" "$AllowedIPs"
+    prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#BRIDGES[@]} "$Address" "$Endpoint" "$AllowedIPs"
   done
 }
 
@@ -926,21 +945,23 @@ show_config() {
   prc "+W%-20s%s+/\n" Key  Value
   prc "+A%-20s%s+/\n"     ---- -----
   local pub val
-  for k in Address DNS MTU ListenPort FwMark PrivateKey PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive; do
-    val=${!k:-(missing)}
-    [[ $k == PrivateKey && ${!k} ]] && val="<HIDDEN>"
-    prc "+c%-20s+Y${!k:++/}%s+/" $k "$val"
-    if [[ $k ==  P*Key && ${!k} ]]; then
-      if pub=$(get_public_key "${!k}"); then
-        [[ $k == PrivateKey ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
+  for p in "${PARAMS[@]}"; do
+    IFS=: read -r section key <<< "$p"
+    v=; val="(missing)"; missing=1; exists=
+    [[ -v PARAM_VAL[$k] ]] && { v=${PARAM_VAL[$p]}; val=$v missing=; exists=1; }
+    [[ $p == "[Interface]:PrivateKey" && $exists ]] && val="<HIDDEN>"
+    prc "+c%-20s+/${missing:++Y}%s+/" $p "$val"
+    if [[ $p == *:P*Key && $exists ]]; then
+      if pub=$(get_public_key "$v"); then
+        [[ $p == "[Interface]:PrivateKey" ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
       else
-        prc " $W +R%s+/ " invalid
+        prc " $W +R%s+/" invalid
       fi
     fi
-    [[ $k == @(Address|PrivateKey|PublicKey|Endpoint|AllowedIPs) && ! ${!k} ]] && prc " $W +R%s+/ " required
+    [[ -v REQUIRED_PARAMS[$p] && $missing ]] && prc " $W +R%s+/" required
     printf "\n"
-  done
-  if (( ${#WGC_BRIDGES[@]} > 0 )); then
+  done # XXX TODO
+  if (( ${#BRIDGES[@]} > 0 )); then
     echo
     local bridge_data b_name b_ext b_int
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
@@ -1052,28 +1073,25 @@ process_config_line() {
 }
 
 validate_parameters() {
-  local p v n section key IFS=:
-  local -A REQUIRED_PARAM=( [[Interface]:Address]=1 [[Interface]:PrivateKey]=1 \
-                            [[Peer]:PublicKey]=1 [[Peer]:Endpoint]=1 [[Peer]:AllowedIPs]=1 )
+  local p v n section key
   for p in "${!PARAM_VAL[@]}"; do
-    read -r section key <<< "$p"
+    IFS=: read -r section key <<< "$p"
     v=${PARAM_VAL[$p]}; n=${PARAM_LNO[$p]}
     case "$section" in
       "[Interface]")
+        [[ $key == @(Address|DNS) ]] || check_dup || continue
         case "$key" in
           Address)
-            unset REQUIRED_PARAM[$p]
             collect_all_ipv4_cidr "$v" PARAM_VAL[$p]
             ;;
           DNS)
             collect_all_ipv4 "$v" PARAM_VAL[$p]
             ;;
           MTU)
-            [[ $v =~ ^[0-9]+$ ]] && ((v >= 576 && v <= 65535)) && continue
+            is_valid_mtu && continue
             add_issue $n "FATAL: Invalid $key value '$v' (must be 576-65535)"
             ;;
           PrivateKey)
-            unset REQUIRED_PARAM[$p]
             is_valid_key "$v" && continue
             add_issue $n "FATAL: Invalid $key value"
             ;;
@@ -1088,17 +1106,16 @@ validate_parameters() {
         esac
         ;;
       "[Peer]")
+        [[ $key == @(AllowedIPs) ]] || check_dup || continue
         case "$key" in
           AllowedIPs)
-            unset REQUIRED_PARAM[$p]
             collect_all_ipv4_cidr "$v" PARAM_VAL[$p]
             ;;
           Endpoint)
-            unset REQUIRED_PARAM[$p]
             validate_resolve_endpoint
             ;;
           PersistentKeepalive)
-            [[ $v =~ ^[0-9]+$ ]] && ((v >= 0 && v <= 65535)) && continue
+            [[ $v =~ ^([1-9][0-9]{0,4}|0)$ ]] && (( v <= 65535 )) && continue
             add_issue $n "FATAL: Invalid $key value, must be 0-65535"
             ;;
           PresharedKey)
@@ -1106,7 +1123,6 @@ validate_parameters() {
             add_issue $n "FATAL: Invalid $key value '$v'"
             ;;
           PublicKey)
-            unset REQUIRED_PARAM[$p]
             is_valid_key "$v" && continue
             add_issue $n "FATAL: Invalid $key value '$v'"
             ;;
@@ -1117,17 +1133,25 @@ validate_parameters() {
         ;;
     esac
   done
+  local -a missing_params=()
+  for p in "${!REQUIRED_PARAMS[@]}"; do
+    [[ -v PARAM_VAL[$p] ]] || missing_params+=( "$p" )
+  done
   local IFS=,
-  (( ${#REQUIRED_PARAM[@]} > 0 )) && add_issue 0 "FATAL: Missing required keys (section:key): ${!REQUIRED_PARAM[*]}"
-  local IFS='' issues="${ISSUES[*]}"
+  (( ${#missing_params[@]} > 0 )) && add_issue 0 "FATAL: Missing required keys (section:key): ${missing_params[*]}"
+  IFS=''; issues="${ISSUES[*]}"
   printf %s "$issues"
-  [[ $issues == *FATAL:* ]] && return 1
-  return 0
+  [[ ! $issues == *FATAL:* ]]
+}
+
+check_dup() {
+  [[ $n == *,* ]] || return 0
+  add_issue $n "FATAL: Duplicated key '$key'"
+  return 1
 }
 
 validate_bridge() {
-  # TODO XXX: look at $n, not $v, to detect duplicates. Also for other keys.
-  if [[ $v == *,* ]]; then
+  if [[ $n == *,* ]]; then
     add_issue $n "FATAL: Duplicated bridge '$key'"
     return 0
   fi
@@ -1166,11 +1190,6 @@ validate_resolve_endpoint() {
     add_issue $n "FATAL: Could not resolve $key host '$_host'"
   }
   return 0
-}
-
-is_valid_port() {
-  local p=$1
-  [[ $p =~ ^(0|[1-9][0-9]*)$ ]] && ((p >= 1 && p <= 65535))
 }
 
 collect_all_ipv4() {
@@ -1228,6 +1247,11 @@ is_valid_ipv4_cidr() {
   [[ $1 =~ $regex ]]
 }
 
+is_valid_port() {
+  local p=$1
+  [[ $p =~ ^(0|[1-9][0-9]*)$ ]] && ((p >= 1 && p <= 65535))
+}
+
 is_valid_key() {
   [[ $1 =~ ^[a-zA-Z0-9+/]{43}=$ ]] && wg pubkey <<< "$1" &>/dev/null
 }
@@ -1236,8 +1260,13 @@ get_public_key() {
   [[ $1 =~ ^[a-zA-Z0-9+/]{43}=$ ]] && wg pubkey <<< "$1" 2>/dev/null
 }
 
+is_valid_mtu() {
+  # min 576 for IPv4, min 1280 for IPv6
+  [[ $v =~ ^([1-9][0-9]{2,4})$ ]] && (( v >= 576 && v <= 65535 ))
+}
+
 is_valid_fwmark() {
-  [[ $1 == off || $1 =~ ^(0x[[:xdigit:]]+|0|[1-9][0-9]*)$ && $1 -le 4294967295 ]]
+  [[ $1 == off || $1 =~ ^(0x[[:xdigit:]]{1,8}|0|[1-9][0-9]{0,9})$ && $1 -le 0xFFFFFFFF ]]
 }
 
 check_dependencies() {
