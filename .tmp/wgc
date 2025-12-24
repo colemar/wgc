@@ -68,9 +68,9 @@ doit() {
 
   (( $# == 0 )) && { show_usage; exit; }
 
-  local -r CMD=${1:-} VPN=${2:-}
-  local DEV=wgc_${VPN:-}
-  local NAMESPACE=$DEV
+  readonly CMD=${1:-} VPN=${2:-}
+  readonly DEV=wgc_${VPN:-}
+  readonly NAMESPACE=$DEV
 
   local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
   local CFGDIR; set_cfgdir; readonly CFGDIR
@@ -558,7 +558,7 @@ configure_vpn_in_namespace() {
       [[ -e $netns_path ]] || error "Cannot locate netns file for '$NAMESPACE'" fatal
 
       for b_ext in "${!BRIDGES[@]}"; do
-        IFS=: read -r b_name b_int <<<"${BRIDGES[$b_name]}"
+        IFS=: read -r b_name b_int <<<"${BRIDGES[$b_ext]}"
         b_sock=/run/wgc.$VPN.$b_name.sock
         b_unit_int=wgc.$VPN.$b_name.int
         b_unit_ext=wgc.$VPN.$b_name.ext
@@ -944,14 +944,14 @@ show_config() {
   echo
   prc "+W%-20s%s+/\n" Key  Value
   prc "+A%-20s%s+/\n"     ---- -----
-  local pub val
+  local v val missing pub
   for p in "${PARAMS[@]}"; do
     IFS=: read -r section key <<< "$p"
-    v=; val="(missing)"; missing=1; exists=
-    [[ -v PARAM_VAL[$k] ]] && { v=${PARAM_VAL[$p]}; val=$v missing=; exists=1; }
-    [[ $p == "[Interface]:PrivateKey" && $exists ]] && val="<HIDDEN>"
+    v=; val="(missing)"; missing=1
+    [[ -v PARAM_VAL[$k] ]] && { v=${PARAM_VAL[$p]}; val=$v; missing=; }
+    [[ $p == "[Interface]:PrivateKey" && ! $missing ]] && val="<HIDDEN>"
     prc "+c%-20s+/${missing:++Y}%s+/" $p "$val"
-    if [[ $p == *:P*Key && $exists ]]; then
+    if [[ $p == *:P*Key && ! $missing ]]; then
       if pub=$(get_public_key "$v"); then
         [[ $p == "[Interface]:PrivateKey" ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
       else
@@ -960,14 +960,14 @@ show_config() {
     fi
     [[ -v REQUIRED_PARAMS[$p] && $missing ]] && prc " $W +R%s+/" required
     printf "\n"
-  done # XXX TODO
+  done
   if (( ${#BRIDGES[@]} > 0 )); then
     echo
     local bridge_data b_name b_ext b_int
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
     prc "+A%-20s%s+/\n"      -----------------   ------------------
-    for bridge_data in "${WGC_BRIDGES[@]}"; do
-      IFS=: read -r b_name b_ext b_int <<<"$bridge_data"
+    for b_ext in "${!BRIDGES[@]}"; do
+      IFS=: read -r b_name b_int <<<"${BRIDGES[$b_ext]}"
       prc "+y%-19s+/ %s +A%s+/ %s\n" "$b_name" "$b_ext" "->" "$b_int"
     done
   fi
@@ -1667,10 +1667,6 @@ remove_openresolv() {
   echo "Done. System returned to APT management."
 }
 
-has_namespace() {
-  [[ -f /run/netns/$NAMESPACE || -f /var/run/netns/$NAMESPACE ]]
-}
-
 is_connected() {
   HAS_NAMESPACE= IN_NAMESPACE=
 
@@ -1682,6 +1678,10 @@ is_connected() {
   ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null || return 1
   IN_NAMESPACE=$NAMESPACE
   return 0
+}
+
+has_namespace() {
+  [[ -f /run/netns/$NAMESPACE || -f /var/run/netns/$NAMESPACE ]]
 }
 
 validate_vpn_name() {
