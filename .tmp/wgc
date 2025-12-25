@@ -74,6 +74,7 @@ doit() {
 
   local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
   local CFGDIR; set_cfgdir; readonly CFGDIR
+  local IPCMD; set_ipcmd; readonly IPCMD
   local HAS_NAMESPACE IN_NAMESPACE
   local -A PARAM_VAL PARAM_LNO BRIDGES
   mapfile -t PARAMS < <( printf "[Interface]:%s\n" Address DNS MTU ListenPort FwMark PrivateKey
@@ -81,6 +82,7 @@ doit() {
   local -A REQUIRED_PARAMS=( [[Interface]:Address]=1 [[Interface]:PrivateKey]=1 \
                             [[Peer]:PublicKey]=1 [[Peer]:Endpoint]=1 [[Peer]:AllowedIPs]=1 )
   readonly PARAMS REQUIRED_PARAMS
+
 
   case "$CMD" in
     u|up|f|fu|fup|bup|bupd|n|nu|nup|d|do|dow|down|s|st|sta|stat|state|e|ex|exe|exec)
@@ -341,6 +343,48 @@ set_cfgdir() {
   [[ -f "$CFGDIR/wgc_enable" ]] || error "Security: Approval file 'wgc_enable' missing in $CFGDIR. Root must create it." fatal
   [[ ${status:11:1} == r ]] || \
     warn "Add 'r' bit for others to '$CFGDIR' (chmod o+r, current perms: ${status:4}) to enable command completion without sudo prompt."
+}
+
+set_ipcmd() {
+  IPCMD=$(command -v ip) || error "Could not find command 'ip'. Install with: sudo apt install iproute2" fatal blameparent
+}
+
+ipcmd() { # XXX TODO: replace ip commands
+  (( $# > 0 )) || error "ipcmd: no arguments provided" fatal blameparent
+
+  local -a cmd_args=("$@")
+  local err_msg= last_arg=${!#}
+
+  # If last argument begins with ":" then it is a custom error message: extract it.
+  if [[ $last_arg == :* ]]; then
+    err_msg=${last_arg#:}
+    [[ $err_msg ]] || error "ipcmd: empty custom error message" fatal blameparent
+    unset cmd_args[-1] # remove last argument
+  fi
+
+  # At least one argument is needed for ip command
+  (( ${#cmd_args[@]} > 0 )) || error "ipcmd: no command provided (only custom error message)" fatal blameparent
+
+  local full_cmd="$IPCMD ${cmd_args[*]}"
+  local output exit_code
+
+  # Execute ip command and capture both stdout and stderr for comprehensive error reporting
+  if ! output=$($IPCMD "${cmd_args[@]}" 2>&1); then
+    local exit_code=$?
+    if [[ $err_msg ]]; then
+      error "$err_msg
+             Command: $full_cmd
+             Exit code: $exit_code
+             → $output" fatal blameparent
+    else
+      error "Command failed: $full_cmd
+             Exit code: $exit_code
+             → $output" fatal blameparent
+    fi
+  fi
+
+  [[ $output ]] && printf '%s\n' "$output"
+  return 0
 }
 
 start_vpn() {
