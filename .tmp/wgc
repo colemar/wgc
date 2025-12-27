@@ -76,12 +76,13 @@ doit() {
   local CFGDIR; set_cfgdir; readonly CFGDIR
   local IPCMD; set_ipcmd; readonly IPCMD
   local HAS_NAMESPACE IN_NAMESPACE
-  local -A PARAM_VAL PARAM_LNO BRIDGES
-  mapfile -t PARAMS < <( printf "[Interface]:%s\n" Address DNS MTU ListenPort FwMark PrivateKey
-                         printf "[Peer]:%s\n" PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive )
-  local -A REQUIRED_PARAMS=( [[Interface]:Address]=1 [[Interface]:PrivateKey]=1 \
-                            [[Peer]:PublicKey]=1 [[Peer]:Endpoint]=1 [[Peer]:AllowedIPs]=1 )
-  readonly PARAMS REQUIRED_PARAMS
+  local -A PARAM_VAL PARAM_LNO
+  mapfile -t PARAMS < <( printf "[Interface]:%s\n" Address DNS MTU ListenPort FwMark PrivateKey;
+                         printf "[Peer]:%s\n" PublicKey PresharedKey Endpoint AllowedIPs PersistentKeepalive;
+                         printf "[WGC]:%s\n" Bridges )
+  local -A PARAM_ATTR= ( [[Interface]:Address]=mr [[Interface]:DNS]=m- [[Interface]:PrivateKey]=-r
+                         [[Peer]:PublicKey]=-r [[Peer]:Endpoint]=-r [[Peer]:AllowedIPs]=mr )
+  readonly PARAMS PARAM_ATTR
 
 
   case "$CMD" in
@@ -1052,7 +1053,7 @@ show_config() {
         prc " $W +R%s+/" invalid
       fi
     fi
-    [[ -v REQUIRED_PARAMS[$p] && $missing ]] && prc " $W +R%s+/" required
+    [[ $missing && ${PARAM_ATTR[$p]:-} == ?r* ]] && prc " $W +R%s+/" required
     printf "\n"
   done
   if (( ${#BRIDGES[@]} > 0 )); then
@@ -1152,8 +1153,10 @@ process_config_line() {
       case "$key" in
         AllowedIPs|Endpoint|PersistentKeepalive|PresharedKey|PublicKey) key_found=1 ;;
       esac ;;
-    "[WGC-Bridges]")
-      key_found=1
+    "[WGC]")
+      case "$key" in
+        Bridges) key_found=1 ;;
+      esac ;;
       [[ $p_bridges ]] || sect_ignore=1
       ;;
     *) return 1 ;;
@@ -1168,69 +1171,19 @@ process_config_line() {
 }
 
 validate_parameters() {
-  local p v n section key
+  local p v n section key func_name
   for p in "${!PARAM_VAL[@]}"; do
     IFS=: read -r section key <<< "$p"
     v=${PARAM_VAL[$p]}; n=${PARAM_LNO[$p]}
-    case "$section" in
-      "[Interface]")
-        [[ $key == @(Address|DNS) ]] || check_dup || continue
-        case "$key" in
-          Address)
-            collect_all_ipv4_cidr
-            ;;
-          DNS)
-            collect_all_ipv4
-            ;;
-          MTU)
-            is_valid_mtu && continue
-            add_issue $n "FATAL: Invalid $key value '$v' (must be 576-65535)"
-            ;;
-          PrivateKey)
-            is_valid_key "$v" && continue
-            add_issue $n "FATAL: Invalid $key value"
-            ;;
-          ListenPort)
-            is_valid_port "$v" || { add_issue $n "FATAL: Invalid $key value '$v' (must be 1-65535)"; continue; }
-            [[ $(ss -lnuH "sport = :$v") ]] && add_issue $n "FATAL: UDP port '$v' is already used."
-            ;;
-          FwMark)
-            is_valid_fwmark "$v" && continue
-            add_issue $n "FATAL: Invalid $key value '$v' (must be 0-4294967295 0x0-0xFFFFFFFF)"
-            ;;
-        esac
-        ;;
-      "[Peer]")
-        [[ $key == @(AllowedIPs) ]] || check_dup || continue
-        case "$key" in
-          AllowedIPs)
-            collect_all_ipv4_cidr
-            ;;
-          Endpoint)
-            validate_resolve_endpoint
-            ;;
-          PersistentKeepalive)
-            [[ $v =~ ^([1-9][0-9]{0,4}|0)$ ]] && (( v <= 65535 )) && continue
-            add_issue $n "FATAL: Invalid $key value, must be 0-65535"
-            ;;
-          PresharedKey)
-            is_valid_key "$v" && continue
-            add_issue $n "FATAL: Invalid $key value '$v'"
-            ;;
-          PublicKey)
-            is_valid_key "$v" && continue
-            add_issue $n "FATAL: Invalid $key value '$v'"
-            ;;
-        esac
-        ;;
-      "[WGC-Bridges]")
-        validate_bridge
-        ;;
-    esac
+    # If it isn't a multivalued key, check for duplicate
+    [[ ${PARAM_ATTR[$p]:-} == m* ]] || check_dup || continue
+    func_name="validate_${section//[\[\]]/}_$key"
+    declare -F "$func_name" >/dev/null && "$func_name" || add_issue $n "FATAL: Internal error - Missing function '$func_name'"
   done
   local -a missing_params=()
-  for p in "${!REQUIRED_PARAMS[@]}"; do
-    [[ -v PARAM_VAL[$p] ]] || missing_params+=( "$p" )
+  for p in "${!PARAM_ATTR[@]}"; do
+    # If parameter was not parsed and is required, then it is missing
+    [[ ! -v PARAM_VAL[$p] && ${PARAM_ATTR[$p]:-} == ?r* ]] && missing_params+=( "$p" )
   done
   local IFS=,
   (( ${#missing_params[@]} > 0 )) && add_issue 0 "FATAL: Missing required keys (section:key): ${missing_params[*]}"
@@ -1245,50 +1198,93 @@ check_dup() {
   return 1
 }
 
-validate_bridge() {
-  if [[ $n == *,* ]]; then
-    add_issue $n "FATAL: Duplicated bridge '$key'"
-    return 0
-  fi
-  if [[ ! $v =~ ^([0-9]+)[[:space:]]*:[[:space:]]*([0-9]+)$ ]]; then
-    add_issue $n "FATAL: Bridge '$key' has invalid format '$v', must be <number>:<number>"
-    return 0
-  fi
-  local ext_port="${BASH_REMATCH[1]}"; int_port="${BASH_REMATCH[2]}"
-  if ! is_valid_port $ext_port; then
-    add_issue $n "FATAL: Bridge '$key' has invalid port '$ext_port', must be 1-65535"
-    return 0
-  fi
-  if ! is_valid_port $int_port; then
-    add_issue $n "FATAL: Bridge '$key' has invalid port '$int_port', must be 1-65535"
-    return 0
-  fi
-  if [[ -v BRIDGES[$ext_port] ]]; then
-    local key2=${BRIDGES[$ext_port]%:*}
-    local issue="FATAL: Bridge '$key' has external port '$ext_port' conflicting "
-         issue+="with bridge '$key2' at line ${PARAM_LNO[$section:$key2]}"
-    add_issue $n "$issue"
-    return 0
-  fi
-  BRIDGES[$ext_port]=$key:$int_port
+validate_Interface_Address() {
+  collect_all_ipv4_cidr " "
 }
 
-validate_resolve_endpoint() {
-  if [[ ! $v =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]]; then
-    add_issue $n "FATAL: Invalid $key value '$v'"
-    return 0
-  fi
+validate_Interface_DNS() {
+  collect_all_ipv4 " "
+}
+
+validate_Interface_MTU() {
+  # min 576 for IPv4, min 1280 for IPv6
+  [[ $v =~ ^([1-9][0-9]{2,4})$ ]] && (( v >= 576 && v <= 65535 )) && return 0
+  add_issue $n "FATAL: Invalid $key value '$v' (must be 576-65535)"
+}
+
+validate_Interface_PrivateKey() {
+  is_valid_key "$v" && return 0
+  add_issue $n "FATAL: Invalid $key value"
+}
+
+validate_Interface_ListenPort() {
+  is_valid_port "$v" || { add_issue $n "FATAL: Invalid $key value '$v' (must be 1-65535)"; return 0; }
+  [[ $(ss -lnuH "sport = :$v") ]] && add_issue $n "FATAL: UDP port '$v' is already used."
+  return 0
+}
+
+validate_Interface_FwMark() {
+  [[ $1 == off || $1 =~ ^(0x[[:xdigit:]]{1,8}|0|[1-9][0-9]{0,9})$ && $1 -le 0xFFFFFFFF ]] && return 0
+  add_issue $n "FATAL: Invalid $key value '$v' (must be 0-4294967295 0x0-0xFFFFFFFF)"
+}
+
+validate_Peer_AllowedIPs() {
+  collect_all_ipv4_cidr ","
+}
+
+validate_Peer_Endpoint() {
+  [[ ! $v =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]] && { add_issue $n "FATAL: Invalid $key value '$v'"; return 0; }
   local host=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
   is_valid_port "$port" || add_issue $n "FATAL: Invalid $key port '$port'"
   if ! is_valid_ipv4 "$host"; then
     local ip
     read -r ip _ < <(getent ahostsv4 "$host") || true
     [[ $ip ]] && host=$ip || add_issue $n "FATAL: Could not resolve $key host '$host'"
+  else
+    PARAM_VAL[$p]="$host:$port"
   fi
-  PARAM_VAL[$p]="$host:$port"
+  return 0
+}
+
+validate_Peer_PersistentKeepalive() {
+  [[ $v =~ ^([1-9][0-9]{0,4}|0)$ ]] && (( v <= 65535 )) && return 0
+  add_issue $n "FATAL: Invalid $key value, must be 0-65535"
+}
+
+validate_Peer_PresharedKey() {
+  validate_Peer_PublicKey
+}
+
+validate_Peer_PublicKey()  {
+  is_valid_key "$v" && return 0
+  add_issue $n "FATAL: Invalid $key value '$v'"
+}
+
+validate_WGC_Bridges() {
+  local bridge name ext int
+  local -A seen_names=() seen_ext_ports=()
+  local -a bridges=()
+
+  for bridge in ${v//,/ }; do
+    [[ $bridge =~ ^([a-zA-Z][a-zA-Z0-9_-]*):([0-9]+):([0-9]+)$ ]] || \
+      { add_issue $n "FATAL: Invalid bridge '$bridge'. Format must be <name>:<number>:<number>"; continue; }
+    name=${BASH_REMATCH[1]}; ext=${BASH_REMATCH[2]}; int=${BASH_REMATCH[3]}
+    [[ -v seen_names[$name] ]] && { add_issue $n "FATAL: Duplicate bridge name '$name' in Bridges list"; continue; }
+    seen_names[$name]=1
+    local pok=1
+    is_valid_port "$ext" || { add_issue $n "FATAL: Bridge '$name' has invalid external port '$ext', must be 1-65535"; pok=; }
+    is_valid_port "$int" || { add_issue $n "FATAL: Bridge '$name' has invalid internal port '$int', must be 1-65535"; pok=; }
+    [[ $pok ]] || continue
+    [[ -v seen_ext_ports[$ext] ]] && \
+      { add_issue $n "FATAL: Bridge '$name' ext. port $ext conflicting with bridge '${seen_ext_ports[$ext]}'"; continue; }
+    seen_ext_ports[$ext]=$name
+    bridges+=( "$name:$ext:$int" )
+  done
+  local IFS=' '; PARAM_VAL[[WGC]:Bridges]="${bridges[*]}"
 }
 
 collect_all_ipv4() {
+  local sep=$1
   local -A seen=()
   local -a out=()
   local ip f=0 d=0 b=0 IFS=' '
@@ -1299,7 +1295,7 @@ collect_all_ipv4() {
     fi
     ((++b))
   done
-  IFS=,
+  IFS=$sep
   ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
   ((f==0)) && add_issue $n "FATAL: Could not find any IPv4 address in $key"
   ((d>0))  && add_issue $n "FATAL: Found $d duplicate IPv4 addresses in $key"
@@ -1308,6 +1304,7 @@ collect_all_ipv4() {
 }
 
 collect_all_ipv4_cidr() {
+  local sep=$1
   local -A seen=()
   local -a out=()
   local ip pure_ip f=0 d=0 b=0 IFS=' '
@@ -1318,7 +1315,7 @@ collect_all_ipv4_cidr() {
     fi
     ((++b))
   done
-  IFS=,
+  IFS=$sep
   ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
   ((f==0)) && add_issue $n "FATAL: Could not find any CIDR IPv4 address in $key"
   ((d>0))  && add_issue $n "FATAL: Found $d duplicate/overlapping CIDR IPv4 addresses in $key"
@@ -1356,15 +1353,6 @@ is_valid_key() {
 
 get_public_key() {
   [[ $1 =~ ^[a-zA-Z0-9+/]{43}=$ ]] && wg pubkey <<< "$1" 2>/dev/null
-}
-
-is_valid_mtu() {
-  # min 576 for IPv4, min 1280 for IPv6
-  [[ $v =~ ^([1-9][0-9]{2,4})$ ]] && (( v >= 576 && v <= 65535 ))
-}
-
-is_valid_fwmark() {
-  [[ $1 == off || $1 =~ ^(0x[[:xdigit:]]{1,8}|0|[1-9][0-9]{0,9})$ && $1 -le 0xFFFFFFFF ]]
 }
 
 check_dependencies() {
