@@ -164,7 +164,7 @@ Core Commands:
   fup <vpn>  - Start VPN in Full Tunnel mode (Redirect All Traffic).
                Directs ALL traffic through the VPN tunnel.
                Useful for untrusted networks/public Wi-Fi.
-               Equivalent to 'up' command with AllowedIPs=0.0.0.0/0.
+               Equivalent to 'up', but forces AllowedIPs=0.0.0.0/0.
   bup <vpn>  - Start VPN in Bind-Only mode.
                VPN is accessible, but no traffic is routed automatically because
                neither system routing tables nor DNS settings are modified.
@@ -329,7 +329,8 @@ prc() {
 set_cfgdir() {
   CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
   # Validate directory
-  [[ $CFGDIR == /* ]] || error "WGC_CFGDIR must be an absolute path" fatal
+  [[ $CFGDIR == /* ]] || error "WGC_CFGDIR must be an absolute path: $CFGDIR" fatal
+  [[ -L "$CFGDIR" ]] && error "Symlink not allowed '$CFGDIR'. Check WGC_CFGDIR." fatal
   [[ -d "$CFGDIR" ]] || error "Directory '$CFGDIR' not found. Check WGC_CFGDIR." fatal
   local status=$(stat -c '%U%A' "$CFGDIR" 2>/dev/null)
   [[ $status ]] || error "Could not read status of directory '$CFGDIR'. Access to metadata denied or restricted." fatal
@@ -410,7 +411,7 @@ start_vpn() {
   # Override AllowedIPs for Full Tunnel (fup), Bind-Only (bup/bupd) and Namespace (nup) modes.
   # Instructs WireGuard to allow all traffic in and out of the tunnel.
   if [[ $CMD == @(fup|bup?(d)|nup) ]]; then
-    PARAM_VAL[[Interface]:AllowedIPs]="0.0.0.0/0" # add " ::/0" if IPv6 supported
+    PARAM_VAL[[Peer]:AllowedIPs]="0.0.0.0/0" # add " ::/0" if IPv6 supported
   fi
 
   # Configure WireGuard
@@ -419,11 +420,11 @@ start_vpn() {
   local v s=[Interface]
   v=${PARAM_VAL[$s:ListenPort]:-}; [[$v]] && wgcmd+=' listen-port "$v"'
   v=${PARAM_VAL[$s:FwMark]:-};     [[$v]] && wgcmd+=' fwmark "$v"'
-  v=${PARAM_VAL[$s:PrivateKey]:-};           wgcmd+=' private-key <(printf %s "${v}")'
+  v=${PARAM_VAL[$s:PrivateKey]};             wgcmd+=' private-key <(printf %s "${v}")'
   s=[Peer]
-  v=${PARAM_VAL[$s:PublicKey]:-};                     wgcmd+=' peer "$v"'
-  v=${PARAM_VAL[$s:AllowedIPs]:-};                    wgcmd+=' allowed-ips "$v"'
-  v=${PARAM_VAL[$s:Endpoint]:-};                      wgcmd+=' endpoint "$v"'
+  v=${PARAM_VAL[$s:PublicKey]};                       wgcmd+=' peer "$v"'
+  v=${PARAM_VAL[$s:AllowedIPs]};                      wgcmd+=' allowed-ips "$v"'
+  v=${PARAM_VAL[$s:Endpoint]};                        wgcmd+=' endpoint "$v"'
   v=${PARAM_VAL[$s:PresharedKey]:-};        [[$v]] && wgcmd+=' preshared-key <(printf %s "$v")'
   v=${PARAM_VAL[$s:PersistentKeepalive]:-}; [[$v]] && wgcmd+=' persistent-keepalive "$v"'
   eval "$wgcmd" || {
@@ -479,9 +480,7 @@ configure_vpn_plain() {
   # Always add default route valid only for VPN source addresses (source policy routing)
   set_source_routing
 
-  if [[ $CMD == fup ]]; then
-    set_override_default_route
-  elsif [[ $CMD == up ]]; then
+  if [[ $CMD == @(up|fup) ]]; then
     local set_override= IFS=,
     for k in ${PARAM_VAL[[Peer]:AllowedIPs]}; do
       [[ $k == "0.0.0.0/0" ]] && { set_override=1; continue; }
@@ -490,16 +489,44 @@ configure_vpn_plain() {
     [[ $set_override ]] && set_override_default_route
   fi
 
-  if [[ $CMD == @(up|fup|bupd) && ${PARAM_VAL[[Interface]:DNS]} ]]; then
-    # Configure DNS
+  if [[ $CMD == @(up|fup|bupd) && -v PARAM_VAL[[Interface]:DNS] ]]; then
+    # We have have at least one valid nameserver ip. Configure DNS.
     local k= q= IFS=,
     for k in ${PARAM_VAL[[Interface]:DNS]}; do
       q+="nameserver $k"$'\n'
-      [[ $CMD == bupd ]] && ip route add "$k" dev "$DEV" || warn "Cannot add route to nameserver $k"
+      [[ $CMD == bupd ]] && { ip route add "$k" dev "$DEV" || warn "Cannot add route to nameserver $k"; }
     done
-    echo "$q" | resolvconf -a $DEV -m 0 -x || \
+    if resolvconf -a $DEV -m 0 -x <<< "$q"; then
+      check_dns_reachability "${PARAM_VAL[[Interface]:DNS]}"
+    else
       warn "DNS configuration failed.
             Ensure 'openresolv' is properly installed and configured."
+    fi
+  fi
+}
+
+check_dns_reachability() {
+  IFS=, read -ra dns_servers <<< "$1"
+
+  local nsip route_info current_dev
+  local dns_warnings=
+
+  for nsip in "${dns_servers[@]}"; do
+    if route_info=$(ip route get "$nsip" 2>/dev/null); then
+      if [[ $route_info != *"dev $DEV"* ]]; then
+        if [[ $route_info =~ dev\ ([^[:space:]]+) ]]; then
+          current_dev="${BASH_REMATCH[1]}"
+        else
+          current_dev="unknown"
+        fi
+        dns_warnings+=$'\n'"- LEAK: $nsip is routed via '$current_dev' (not VPN tunnel)."
+      fi
+    else
+      dns_warnings+=$'\n'"- UNREACHABLE: No route found for $nsip."
+    fi
+  done
+  if [[ $dns_warnings ]]; then
+    warn "DNS routing issues detected:$dns_warnings"
   fi
 }
 
@@ -511,8 +538,6 @@ set_override_default_route() {
 set_endpoint_host_route() {
   local ep=${PARAM_VAL[[Peer]:Endpoint]%%:*} route
   local -a route_args
-  is_valid_ipv4 "$ep" || read -r ep _ < <(getent ahostsv4 "$ep") || \
-    error "Cannot resolve Endpoint name '$ep'" fatal
   route=$(ip -j route get "$ep" :"Cannot find route to Endpoint $ep")
   [[ $route =~ \"gateway\":\"([^\"]+)\" ]] && route_args+=(via "${BASH_REMATCH[1]}")
   [[ $route =~ \"dev\":\"([^\"]+)\" ]] || error "Cannot determine output device for Endpoint $ep" fatal
@@ -1152,10 +1177,10 @@ validate_parameters() {
         [[ $key == @(Address|DNS) ]] || check_dup || continue
         case "$key" in
           Address)
-            collect_all_ipv4_cidr "$v" PARAM_VAL[$p]
+            collect_all_ipv4_cidr
             ;;
           DNS)
-            collect_all_ipv4 "$v" PARAM_VAL[$p]
+            collect_all_ipv4
             ;;
           MTU)
             is_valid_mtu && continue
@@ -1166,8 +1191,8 @@ validate_parameters() {
             add_issue $n "FATAL: Invalid $key value"
             ;;
           ListenPort)
-            is_valid_port "$v" && continue
-            add_issue $n "FATAL: Invalid $key value '$v' (must be 1-65535)"
+            is_valid_port "$v" || { add_issue $n "FATAL: Invalid $key value '$v' (must be 1-65535)"; continue; }
+            [[ $(ss -lnuH "sport = :$v") ]] && add_issue $n "FATAL: UDP port '$v' is already used."
             ;;
           FwMark)
             is_valid_fwmark "$v" && continue
@@ -1179,7 +1204,7 @@ validate_parameters() {
         [[ $key == @(AllowedIPs) ]] || check_dup || continue
         case "$key" in
           AllowedIPs)
-            collect_all_ipv4_cidr "$v" PARAM_VAL[$p]
+            collect_all_ipv4_cidr
             ;;
           Endpoint)
             validate_resolve_endpoint
@@ -1251,50 +1276,53 @@ validate_bridge() {
 validate_resolve_endpoint() {
   if [[ ! $v =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]]; then
     add_issue $n "FATAL: Invalid $key value '$v'"
+    return 0
   fi
-  local _host=${BASH_REMATCH[1]}; local _port=${BASH_REMATCH[2]}
-  if ! is_valid_port "$_port"; then
-    add_issue $n "FATAL: Invalid $key port '$_port'"
+  local host=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
+  is_valid_port "$port" || add_issue $n "FATAL: Invalid $key port '$port'"
+  if ! is_valid_ipv4 "$host"; then
+    local ip
+    read -r ip _ < <(getent ahostsv4 "$host") || true
+    [[ $ip ]] && host=$ip || add_issue $n "FATAL: Could not resolve $key host '$host'"
   fi
-  is_valid_ipv4 "$_host" || getent ahostsv4 "$_host" &>&- || {
-    add_issue $n "FATAL: Could not resolve $key host '$_host'"
-  }
-  return 0
+  PARAM_VAL[$p]="$host:$port"
 }
 
 collect_all_ipv4() {
-  local _in=$1 _f=0 _d=0 _b=0
-  local -n _a=$2; _a=
-  local _ip IFS=' '
-  for _ip in ${_in//,/ }; do
-    if is_valid_ipv4 "$_ip"; then
-      [[ $_a, == *",$_ip,"* ]] && ((++_d)) && continue
-      _a+=",$_ip" && ((++_f)) && continue
+  local -A seen=()
+  local -a out=()
+  local ip f=0 d=0 b=0 IFS=' '
+  for ip in ${v//,/ }; do
+    if is_valid_ipv4 "$ip"; then
+      [[ -v seen[$ip] ]] && { ((++d)); continue; }
+      ((++f)); out+=("$ip"); seen[$ip]=1; continue
     fi
-    ((++_b))
+    ((++b))
   done
-  _a=${_a#,}
-  ((f==0)) && add_issue $n "FATAL: Could not find any IPv4 in $key"
-  ((d>0))  && add_issue $n "FATAL: Found $d duplicate IPs in $key"
-  ((b>0))  && add_issue $n "FATAL: Found $b bad IPs in $key"
+  IFS=,
+  ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
+  ((f==0)) && add_issue $n "FATAL: Could not find any IPv4 address in $key"
+  ((d>0))  && add_issue $n "FATAL: Found $d duplicate IPv4 addresses in $key"
+  ((b>0))  && add_issue $n "FATAL: Found $b bad IPv4 addresses in $key"
   return 0
 }
 
 collect_all_ipv4_cidr() {
-  local _in=$1 _f=0 _d=0 _b=0
-  local -n _a=$2; _a=
-  local _ip _pure_ip IFS=' '
-  for _ip in ${_in//,/ }; do
-    if is_valid_ipv4_cidr "$_ip"; then
-      _pure_ip=${_ip%/*}; [[ $_a, == *",$_pure_ip"@(/|,)* ]] && ((++_d)) && continue
-      _a+=",$_ip" && ((++_f)) && continue
+  local -A seen=()
+  local -a out=()
+  local ip pure_ip f=0 d=0 b=0 IFS=' '
+  for ip in ${v//,/ }; do
+    if is_valid_ipv4_cidr "$ip"; then
+      pure_ip=${ip%/*}; [[ -v seen[$pure_ip] ]] && { ((++d)); continue; }
+      ((++f)); out+=("$ip"); seen[$pure_ip]=1; continue
     fi
-    ((++_b))
+    ((++b))
   done
-  _a=${_a#,}
-  ((f==0)) && add_issue $n "FATAL: Could not find any CIDR IPv4 in $key"
-  ((d>0))  && add_issue $n "FATAL: Found $d duplicate/overlapping CIDR IPs in $key"
-  ((b>0))  && add_issue $n "FATAL: Found $b bad CIDR IPs in $key"
+  IFS=,
+  ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
+  ((f==0)) && add_issue $n "FATAL: Could not find any CIDR IPv4 address in $key"
+  ((d>0))  && add_issue $n "FATAL: Found $d duplicate/overlapping CIDR IPv4 addresses in $key"
+  ((b>0))  && add_issue $n "FATAL: Found $b bad CIDR IPv4 addresses in $key"
   return 0
 }
 
