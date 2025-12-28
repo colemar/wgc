@@ -106,7 +106,7 @@ doit() {
     u|up|f|fu|fup|bup?(d)|nup)
       start_vpn
       ;;
-    d|do|dow|down)
+    d|do|dow|down|k|ki|kil|kill) # XXX aggiungi kill al resto, togli p_force
       stop_vpn ${3:-} # can be "force"
       ;;
     s|st|sta|stat|state)
@@ -224,28 +224,30 @@ EOF
 # Argument Syntax:
 # - name=value  -> Sets p_name to "value".
 # - name        -> Sets p_name to "name" (Flag mode, equivalent to name=name).
+# - 2=value     -> Sets p_2 to "value"
 #
 # Constraints & Responsibilities:
 # 1. Caller: Must ensure passed argument keys are valid Bash identifiers (alphanumeric/underscore)
-#    to avoid syntax errors during assignment.
+#    to avoid explicit errors.
 # 2. Function Implementation: Must NOT use local variables starting with 'p_' for internal logic,
 #    as this namespace is reserved for the generated parameters.
 #
 # Example:
 #   func() {
-#     shift 1                        # Remove fixed arguments if any
+#     arg1=$1; shift 1               # Consume and remove fixed positional arguments if any
 #     local p_timeout=10 p_verbose=  # Define defaults (mutable)
 #     eval "$(get_params "$@")"      # Parse arguments, override defaults and lock variables (readonly)
 #     echo "Timeout: $p_timeout"
-#     [[ $p_verbose ]] && echo "Verbose active"
+#     [[ $p_verbose ]] && echo "First argument was: $arg1"
 #   }
-#   func arg1 timeout=30 verbose
+#   func 123 timeout=30 verbose
 #
 get_params() {
   local arg key buf=
   local -i n=1
   for arg; do
     key=${arg%%=*}
+    [[ $key == +([a-zA-Z0-9_]) ]] || { echo "error \"Invalid identifier ${key@Q} in get_params\" fatal"; exit; }
     buf+=" p_$key=\${$n#*=}"
     ((n++))
   done
@@ -1079,7 +1081,7 @@ parse_config_file() {
   while read -r line || [[ $line ]]; do # also read last line if \n is missing
       ((++n))
       line=${line%%#*} # Remove comments
-      [[ ! $line =~ [^[:space:]] ]] && continue # Skip empty lines
+      [[ $line =~ [^[:space:]] ]] || continue # Skip empty lines
       if [[ $line =~ ^[[:space:]]*\[([A-Za-z0-9_-]+)\][[:space:]]*$ ]]; then
         # This line is a section.
         section=${BASH_REMATCH[1]} # Track section
@@ -1731,7 +1733,7 @@ remove_openresolv() {
 
 validate_vpn_name() {
   [[ $VPN =~ ^[a-zA-Z0-9_-]{1,11}$ ]] || \
-    error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max lenght is 11." fatal blameparent
+    error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max length is 11." fatal blameparent
 }
 
 # -----------------------------------------------------------------------------
