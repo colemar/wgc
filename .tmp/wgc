@@ -366,7 +366,7 @@ set_ipcmd() {
 }
 
 ip() {
-  (( $# > 0 )) || error "ipcmd: no arguments provided" fatal blameparent
+  (( $# > 0 )) || error "ip function: no arguments provided" fatal blameparent
 
   local -a cmd_args=("$@")
   local err_msg= silent_fail= last_arg=${!#}
@@ -379,28 +379,27 @@ ip() {
   fi
 
   # At least one argument is needed for ip command
-  (( ${#cmd_args[@]} > 0 )) || error "ipcmd: no command provided" fatal blameparent
+  (( ${#cmd_args[@]} > 0 )) || error "ip function: no command provided" fatal blameparent
 
-  local full_cmd="$IPCMD ${cmd_args[*]}"
-  local output exit_code
-
-  # Execute ip command and capture both stdout and stderr for comprehensive error reporting
-  output=$($IPCMD "${cmd_args[@]}" 2>&1); exit_code=$?
+  # Execute ip command and capture both stdout and stderr for comprehensive error reporting.
+  # If ip command succeeds, print out its output.
+  # When ip command fails:
+  # - if a custom error ":message" is provided as last arg, report and terminate.
+  # - if no custom error message is provided, report and return ip command exit code.
+  # - if last arg is ":", suppress all output and return ip command exit code.
+  local full_cmd output
+  printf -v full_cmd '%q ' "$IPCMD" "${cmd_args[@]}"
+  output=$($IPCMD "${cmd_args[@]}" 2>&1); local exit_code=$?
   if (( exit_code != 0 )); then
     if [[ $err_msg ]]; then
-      error "$err_msg
-             Command: $full_cmd
-             Exit code: $exit_code
-             → $output" fatal blameparent
+      error "$err_msg%%Command: $full_cmd%%Exit code: $exit_code%%→ $output" fatal blameparent
     else
       [[ $silent_fail ]] && return $exit_code
-      error "Command failed: $full_cmd
-             Exit code: $exit_code
-             → $output" blameparent
+      error "Command failed: $full_cmd%%Exit code: $exit_code%%→ $output" blameparent
       return $exit_code
     fi
   fi
-
+  # Print ip command output. Needed for command substitution: $(ip ...)
   [[ $output ]] && printf '%s\n' "$output"
 
   return 0
