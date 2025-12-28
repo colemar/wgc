@@ -431,22 +431,17 @@ start_vpn() {
 
   # Configure WireGuard
   # Notice: this was tested against possible attack vectors, do not modify the general approach!
-  local wgcmd='wg set $DEV'
-  local v s=Interface
-  v=${PARAM_VAL[$s:ListenPort]:-}; [[$v]] && wgcmd+=' listen-port "$v"'
-  v=${PARAM_VAL[$s:FwMark]:-};     [[$v]] && wgcmd+=' fwmark "$v"'
-  v=${PARAM_VAL[$s:PrivateKey]};             wgcmd+=' private-key <(printf %s "${v}")'
-  s=Peer
-  v=${PARAM_VAL[$s:PublicKey]};                       wgcmd+=' peer "$v"'
-  v=${PARAM_VAL[$s:AllowedIPs]};                      wgcmd+=' allowed-ips "$v"'
-  v=${PARAM_VAL[$s:Endpoint]};                        wgcmd+=' endpoint "$v"'
-  v=${PARAM_VAL[$s:PresharedKey]:-};        [[$v]] && wgcmd+=' preshared-key <(printf %s "$v")'
-  v=${PARAM_VAL[$s:PersistentKeepalive]:-}; [[$v]] && wgcmd+=' persistent-keepalive "$v"'
-  eval "$wgcmd" || {
-    eval $'read -r -d "" wgcmd <<EOF\n'"${wgcmd/'${v}'/<HIDDEN>}"$'\nEOF' || true
-    error "Failed to configure WireGuard interface '$DEV' using command:
-           $wgcmd" fatal
-  }
+  wadd() { [[ -v PARAM_VAL[$1] ]] && wgcmd+=" $2 ${PARAM_VAL[$1]}"; }
+  local wgcmd="wg set $DEV"
+  wadd Interface:ListenPort     listen-port
+  wadd Interface:FwMark         fwmark
+  wadd Peer:PublicKey           peer
+  wadd Peer:AllowedIPs          allowed-ips
+  wadd Peer:Endpoint            endpoint
+  wadd Peer:PersistentKeepalive persistent-keepalive
+  local PrivateKey=${PARAM_VAL[Interface:PrivateKey]} PresharedKey=${PARAM_VAL[Peer:PresharedKey]:-}
+  wgcmd+=' private-key <(printf %s "$PrivateKey")'${PresharedKey:+' preshared-key <(printf %s "$PresharedKey")'}
+  eval "$wgcmd" || error "Failed to configure WireGuard interface '$DEV' using command:%%$wgcmd" fatal
 
   # Protect endpoint reachability against:
   # - override routes 0/1 and 128/1 possibly added in configure_vpn_plain()
@@ -1840,7 +1835,7 @@ warn() {
 indent_multiline() {
   local -n _ref=$1
   # %% or newline means: newline and indent 2
-  _ref=$(printf %s "${_ref}" | sed -z -E 's/[[:blank:]]*(%%|\n)[[:blank:]]*/\n  /g')
+  _ref="${_ref//*( )@(%%|$'\n')*( )/$'\n  '}"
 }
 
 # -----------------------------------------------------------------------------
