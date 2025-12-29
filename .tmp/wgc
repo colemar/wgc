@@ -20,6 +20,8 @@
 # Guard against sourcing.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
+shopt -s extglob
+
 doit() {
   if [ -z "$BASH_VERSION" ]; then
     echo "ERROR: This script requires Bash. Please run with 'wgc'." >&2
@@ -66,7 +68,7 @@ doit() {
   export LC_ALL=C LANG=C
   local IFS=$' \t\n'
 
-  (( $# == 0 )) && { show_usage; exit; }
+  #(( $# == 0 )) && { show_usage; exit; }
 
   readonly CMD=${1:-} VPN=${2:-}
   readonly DEV=wgc_${VPN:-}
@@ -90,17 +92,6 @@ doit() {
     PARAMS+=( $section:$key ); PARAM_ATTR[$section:$key]=$attr; SECTIONS[$section]=1
   done
   readonly PARAMS PARAM_ATTR SECTIONS
-
-  case "$CMD" in
-    up|fup|bup|bupd|nup|down|kill|state|exec)
-      validate_vpn_name
-      local ns=$(ip netns identify) || true
-      [[ $ns ]] && error "Usage of wgc is not supported inside a network namespace ($ns)" fatal
-      ;;
-    conf|parse)
-      validate_vpn_name
-      ;;
-  esac
 
   case "$CMD" in
     up|fup|bup?(d)|nup)
@@ -128,8 +119,7 @@ doit() {
       check_dependencies
       ;;
     exec)
-      shift 2
-      exec_in_namespace "$@"
+      exec_in_namespace "${@:3}"
       ;;
     completion)
       enable_completion
@@ -158,65 +148,96 @@ doit() {
 }
 
 show_usage() {
-  cat <<EOF
-Usage:
+  local a= b= c= n=
+  if [[ $HAS_COLORS ]]; then
+    a=$'\e[1m'
+    b=$'\e[32m'
+    c=$'\e[33m'
+    n=$'\e[0m'
+  fi
+  local usage
+  read -r -d '' usage <<EOF || true
+${a}Usage:${n}
   wgc <command> [<vpn>]
   wgc exec <vpn> <cmd> [args...]
 
-Core Commands:
-  up <vpn>   - Start VPN in Standard mode.
+${a}Core Commands:${n}
+  ${b}up${n} <vpn>   - Start VPN in ${c}Standard mode${n}.
                Adds routes defined in AllowedIPs, applying special handling
                for 0.0.0.0/0 to prevent loops.  Effect: Automatically handles
-               Split Tunnel or Full Tunnel based on configuration file.
+               ${c}Split Tunnel${n} or ${c}Full Tunnel${n} based on configuration file.
                Operation is similar to 'wg-quick'. See manual for details.
-  fup <vpn>  - Start VPN in Full Tunnel mode.
+  ${b}fup${n} <vpn>  - Start VPN in ${c}Full Tunnel${n} mode.
                Directs ALL traffic through the VPN tunnel.
                Useful for untrusted networks/public Wi-Fi.
                Equivalent to 'up', but forces AllowedIPs=0.0.0.0/0.
-  bup <vpn>  - Start VPN in Bind-Only mode.
+  ${b}bup${n} <vpn>  - Start VPN in ${c}Bind-Only${n} mode.
                VPN is accessible, but no traffic is routed automatically because
                neither system routing tables nor DNS settings are modified.
                Traffic enters the tunnel if and only if it is explicitly bound
                to the VPN interface or its IP address.
-  bupd <vpn> - Start VPN in Bind-Only mode with DNS.
+  ${b}bupd${n} <vpn> - Start VPN in ${c}Bind-Only mode with DNS${n}.
                Like 'bup', but enforces VPN DNS settings system-wide like 'up' does.
                Routes are added only for the nameservers to ensure reachability.
                Data traffic still requires explicit binding, but DNS resolution
                is performed via the VPN tunnel for the entire system.
-  nup <vpn>  - Start VPN in Namespace mode.
+  ${b}nup${n} <vpn>  - Start VPN in ${c}Namespace${n} mode.
                The VPN operates in a dedicated Network Namespace (isolated stack)
-               named wgc_<vpn>.
+               named ${c}wgc_<vpn>${n}.
                ALL traffic in the namespace sandbox is directed through the VPN
                tunnel via default route.  The rest of the system is unaffected.
-               Applications must be launched via 'wgc exec'.
+               Applications must be launched via '${c}wgc exec${n}'.
                Supports TCP port forwarding (via <vpn>.conf) to expose namespace
                services to the host.
-  down <vpn> - Stop the VPN and revert network state (routes, DNS, namespace).
-  kill <vpn> - Like 'down'. Also kills any process running in VPN namespace.
+  ${b}down${n} <vpn> - Stop the VPN and revert network state (routes, DNS, namespace).
+  ${b}kill${n} <vpn> - Like 'down'. Also kills any process running in VPN namespace.
 
-Inspection & Utils:
-  state <vpn> - Show detailed state of a specific VPN.
-  act         - List only active VPN interfaces.
-  list        - List all available config files.
-  conf <vpn>  - Display the content of <vpn>.conf.
-  parse <vpn> - Check syntax and show parsed parameters for <vpn>.conf.
-  req         - Verify that required dependencies are installed.
+${a}Inspection & Utils:${n}
+  ${b}state${n} <vpn> - Show detailed state of a specific VPN.
+  ${b}act${n}         - List only active VPN interfaces.
+  ${b}list${n}        - List all available config files.
+  ${b}conf${n} <vpn>  - Display the content of <vpn>.conf.
+  ${b}parse${n} <vpn> - Check syntax and show parsed parameters for <vpn>.conf.
+  ${b}req${n}         - Verify that required dependencies are installed.
 
-Execution:
-  exec <vpn> - Run a command inside the VPN Network Namespace.
+${a}Execution:${n}
+  ${b}exec${n} <vpn> - Run a command inside the VPN Network Namespace.
                Only valid if VPN was started with 'nup'.
                Example, run 'curl ipinfo.io' in 'office' VPN namespace:
-                 wgc exec office curl ipinfo.io
+                 ${c}wgc exec office curl ipinfo.io${n}
 
-Configuration:
+${a}Configuration:${n}
   <vpn> must match a file in \$WGC_CFGDIR (Default: /etc/wireguard).
   Example: 'office' matches '/etc/wireguard/office.conf'.
   Export WGC_CFGDIR to override the default configuration directory.
 
-Bash Completion:
-  To enable bash completion: wgc completion
+${a}Bash Completion:${n}
+  To enable bash completion: ${c}wgc completion${n}
   Redo completion if WGC_CFGDIR is changed.
 EOF
+printf "%s\n" "$usage"
+}
+
+# The lack of a ternary operator in Bash prompted me to create an improved version.
+# Implements an inline switch/case logic, inspired by Oracle SQL's DECODE function.
+# Unlike a standard map, comparison keys are treated as Bash glob/extglob patterns.
+#
+# Usage:
+#   $(decode <input> <pattern1> <result1> <pattern2> <result2> ... [<default>])
+#
+# Matches <input> against a series of patterns, printing the result of the first match.
+# If no matches are found, prints the last argument (if any).
+# Always returns 0 (success) as exit code.
+decode() {
+  local val=$1; shift
+  while (( $# >= 2 )); do
+    # $1 is a glob/extglob pattern
+    [[ $val == $1 ]] && { printf '%s\n' "$2"; return 0; }
+    shift 2
+  done
+  # If a single arg remains, it's the default result
+  (( $# > 0 )) && printf '%s\n' "$1"
+  return 0
 }
 
 # Minimalist argument parser helper.
@@ -406,6 +427,7 @@ ip() {
 }
 
 start_vpn() {
+  assert_no_namespace; validate_vpn_name
   is_connected && \
     error "$VPN is already connected${IN_NAMESPACE:+ in namespace $NAMESPACE}
            To reconnect, first stop it: wgc down $VPN" fatal
@@ -413,7 +435,7 @@ start_vpn() {
   [[ $CMD == nup ]] || check_openresolv
 
   # get parameters and forwarding bridges from config file named $VPN
-  parse_config_file $VPN $([[ $CMD == nup ]] && echo bridges)
+  parse_config_file $VPN $(decode $CMD nup bridges)
 
   [[ ${PARAM_VAL[MTU]:-} ]] && compute_mtu
 
@@ -563,7 +585,7 @@ del_endpoint_host_route() {
 
 set_source_routing() {
   local -i t
-  for ((t=51820; t<52000; t++))
+  for ((t=51820; t<52000; t++)); do
     [[ $(ip route show table $t :) ]] || break
   done
   ((t > 51999)) && error "Could not find an empty routing table in the range 51820..51999" fatal
@@ -632,7 +654,7 @@ configure_vpn_in_namespace() {
   fi
 
   # Start proxyd/socat bridges
-  if [[ -v PARAM_VAL[WGC:Bridges] ]]
+  if [[ -v PARAM_VAL[WGC:Bridges] ]]; then
 
     local PROXYD_BIN
     for PROXYD_BIN in /lib/systemd/systemd-socket-proxyd /usr/lib/systemd/systemd-socket-proxyd ""; do
@@ -741,6 +763,7 @@ start_transient_service() {
 }
 
 stop_vpn() {
+  assert_no_namespace; validate_vpn_name
   local stopping=
   if is_connected; then
     stopping=1
@@ -851,6 +874,7 @@ clean_vpn() {
 }
 
 show_state() {
+  assert_no_namespace; validate_vpn_name
   local p_bridges=
   eval "$(get_params "$@")"
 
@@ -1016,6 +1040,7 @@ list_config_files() {
 }
 
 show_config_file() {
+  validate_vpn_name
   local -r config_file="$CFGDIR/$VPN.conf"
   [[ -f $config_file ]] || error "File not found: $config_file" fatal
   [[ -L $config_file ]] && error "Security: Symlinks are not allowed: $config_file" fatal
@@ -1024,6 +1049,7 @@ show_config_file() {
 }
 
 show_parsed_config_file() {
+  validate_vpn_name
   parse_config_file $VPN bridges report
   show_config
 }
@@ -1052,7 +1078,7 @@ show_config() {
   if [[ -v PARAM_VAL[WGC:Bridges] ]]; then
     echo
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
-    prc "+A%-20s%s+/\n"      -----------------   ------------------
+    prc "+A%-20s%s+/\n"  -----------------   ------------------
     local b b_name b_ext b_int IFS=$'\x20'
     for b in ${PARAM_VAL[WGC:Bridges]}; do
       IFS=: read -r b_name b_ext b_int <<< "$b"
@@ -1345,6 +1371,7 @@ check_dependencies() {
 }
 
 exec_in_namespace() {
+  assert_no_namespace; validate_vpn_name
   [[ $# -eq 0 ]] && { error "No command specified"; show_usage; exit 1; }
   is_connected || error "VPN $VPN is not connected. Start it first with: wgc nup $VPN" fatal
   [[ $IN_NAMESPACE ]] || error "VPN $VPN is not in its own namespace. Just use plain command: $*" fatal
@@ -1464,20 +1491,29 @@ _wgc_completion() {
 
   # Complete the first arg with main commands
   if [[ $COMP_CWORD -eq 1 ]]; then
+    compopt +o default
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     return 0
   fi
 
   # Complete the second arg depending on command
   if [[ $COMP_CWORD -eq 2 ]]; then
+    if [[ "$cur" == [\<\>\|\&\;]* ]]; then
+      compopt -o default
+      COMPREPLY=()
+      return 0
+    fi
+    compopt +o default # disable default (no files if no match)
     case "$prev" in
       up|fup|bup|bupd|nup|conf|parse)
         # VPN config file list
-        local v
-        local modtime=$(stat -c %y "${WGC_CFGDIR:-/etc/wireguard}" 2>/dev/null)
-        if [[ ! $_wgc_last_cfgdir_modtime || $modtime != "$_wgc_last_cfgdir_modtime" ]]; then
-          _wgc_last_cfgdir_modtime=$modtime
-          local -a c=( /usr/bin/find "${WGC_CFGDIR:-/etc/wireguard}" -maxdepth 1 -name \*.conf -type f )
+        local v modtime=$(stat -c %y "$cfgdir_path" 2>/dev/null) cfgdir_path=${WGC_CFGDIR:-/etc/wireguard}
+        if [[ $_wgc_last_cfgdir_modtime && $modtime == "$_wgc_last_cfgdir_modtime" \
+              && $cfgdir_path == "$_wgc_last_cfgdir_path" ]]; then
+          v=$_wgc_last_cfgdir_list
+        else
+          _wgc_last_cfgdir_modtime=$modtime; _wgc_last_cfgdir_path=$cfgdir_path
+          local -a c=( /usr/bin/find "$cfgdir_path" -maxdepth 1 -name \*.conf -type f )
           local -a files
           files=($("${c[@]}" 2>/dev/null)) || files=($(sudo "${c[@]}" 2>/dev/null)) || return 1
           local f
@@ -1487,8 +1523,6 @@ _wgc_completion() {
             v+="$f "
           done
           _wgc_last_cfgdir_list=$v
-        else
-          v=$_wgc_last_cfgdir_list
         fi
         COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
@@ -1526,6 +1560,13 @@ _wgc_completion() {
   if [[ $COMP_CWORD -gt 2 ]]; then
     case "${COMP_WORDS[1]}" in
       exec)
+        if [[ $COMP_CWORD -eq 3 ]]; then
+          compopt +o default
+          if [[ ${#cur} -lt 1 ]]; then # minimum 1 char for system commmands completion
+            COMPREPLY=()
+            return 0
+          fi
+        fi
         if declare -F _command_offset &>/dev/null; then
           # Use advanced completion if available
           _command_offset 3
@@ -1544,7 +1585,7 @@ _wgc_completion() {
   fi
 }
 
-complete -F _wgc_completion wgc
+complete -o bashdefault -o default -F _wgc_completion wgc
 EOF
 
   chmod 644 "$completion_file"
@@ -1560,7 +1601,8 @@ EOF
   _wgc_last_cfgdir_modtime=$(stat -c %y "$CFGDIR" 2>/dev/null)
   printf "%s\n" \
     "_wgc_last_cfgdir_list=${_wgc_last_cfgdir_list@Q}" \
-    "_wgc_last_cfgdir_modtime=${_wgc_last_cfgdir_modtime@Q}" >> "$completion_file"
+    "_wgc_last_cfgdir_modtime=${_wgc_last_cfgdir_modtime@Q}" \
+    "_wgc_last_cfgdir_path=${CFGDIR@Q}" >> "$completion_file"
 
   [[ $(stat -c %A "$CFGDIR") == *r?? ]] || \
     warn "Completion for non-root users will use sudo to access configuration directory
@@ -1733,6 +1775,11 @@ validate_vpn_name() {
     error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max length is 11." fatal blameparent
 }
 
+assert_no_namespace() {
+  local ns
+  ns=$(ip netns identify :) && [[ $ns ]] && error "Usage of wgc is not supported inside a network namespace ($ns)" fatal blameparent
+}
+
 # -----------------------------------------------------------------------------
 
 # Stack for cleanup functions
@@ -1786,7 +1833,7 @@ error() {
       show_traceback >&2
       ;;
     TRAP-INT)
-      echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&
+     echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&2
       ;;
     TRAP-TERM)
       echo "${W} Terminated by signal (SIGTERM) @$line while executing '$BASH_COMMAND'" >&2
