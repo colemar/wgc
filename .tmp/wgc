@@ -82,7 +82,7 @@ doit() {
   local -a PARAM_DEFS=(
     Interface:{Address:mr,DNS:m-,MTU:--,ListenPort:--,FwMark:--,PrivateKey:-r}
     Peer:{PublicKey:-r,PresharedKey:--,Endpoint:-r,AllowedIPs:mr,PersistentKeepalive:--}
-    WGC:{Bridges:m-}
+    WGC:Bridges:m-
   )
   local -a PARAMS
   local -A PARAM_ATTR SECTIONS
@@ -92,6 +92,7 @@ doit() {
     PARAMS+=( $section:$key ); PARAM_ATTR[$section:$key]=$attr; SECTIONS[$section]=1
   done
   readonly PARAMS PARAM_ATTR SECTIONS
+  declare -a CLEANUP_STACK=()
 
   case "$CMD" in
     up|fup|bup?(d)|nup)
@@ -150,9 +151,9 @@ doit() {
 show_usage() {
   local a= b= c= n=
   if [[ $HAS_COLORS ]]; then
-    a=$'\e[1m'
-    b=$'\e[32m'
-    c=$'\e[33m'
+    a=${COLORS[G]}
+    b=${COLORS[R]}
+    c=${COLORS[y]}
     n=$'\e[0m'
   fi
   local usage
@@ -187,10 +188,10 @@ ${a}Core Commands:${n}
                ALL traffic in the namespace sandbox is directed through the VPN
                tunnel via default route.  The rest of the system is unaffected.
                Applications must be launched via '${c}wgc exec${n}'.
-               Supports TCP port forwarding (via <vpn>.conf) to expose namespace
+               Supports TCP ${c}port forwarding${n} (via <vpn>.conf) to expose namespace
                services to the host.
   ${b}down${n} <vpn> - Stop the VPN and revert network state (routes, DNS, namespace).
-  ${b}kill${n} <vpn> - Like 'down'. Also kills any process running in VPN namespace.
+  ${b}kill${n} <vpn> - Like 'down'. Also ${c}kills${n} any process running in VPN namespace.
 
 ${a}Inspection & Utils:${n}
   ${b}state${n} <vpn> - Show detailed state of a specific VPN.
@@ -209,13 +210,12 @@ ${a}Execution:${n}
 ${a}Configuration:${n}
   <vpn> must match a file in \$WGC_CFGDIR (Default: /etc/wireguard).
   Example: 'office' matches '/etc/wireguard/office.conf'.
-  Export WGC_CFGDIR to override the default configuration directory.
+  Export ${c}WGC_CFGDIR${n} to override the default configuration directory.
 
 ${a}Bash Completion:${n}
   To enable bash completion: ${c}wgc completion${n}
-  Redo completion if WGC_CFGDIR is changed.
 EOF
-printf "%s\n" "$usage"
+printf "\n%s\n\n" "$usage"
 }
 
 # The lack of a ternary operator in Bash prompted me to create an improved version.
@@ -1062,7 +1062,7 @@ show_config() {
   for p in "${PARAMS[@]}"; do
     IFS=: read -r section key <<< "$p"
     v=; val="(missing)"; missing=1
-    [[ -v PARAM_VAL[$k] ]] && { v=${PARAM_VAL[$p]}; val=$v; missing=; }
+    [[ -v PARAM_VAL[$p] ]] && { v=${PARAM_VAL[$p]}; val=$v; missing=; }
     [[ $p == "Interface:PrivateKey" && ! $missing ]] && val="<HIDDEN>"
     prc "+c%-20s+/${missing:++Y}%s+/" $p "$val"
     if [[ $p == *:P*Key && ! $missing ]]; then
@@ -1075,6 +1075,7 @@ show_config() {
     [[ $missing && ${PARAM_ATTR[$p]:-} == ?r* ]] && prc " $W +R%s+/" required
     printf "\n"
   done
+  return 0
   if [[ -v PARAM_VAL[WGC:Bridges] ]]; then
     echo
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
@@ -1143,12 +1144,12 @@ parse_config_file() {
       process_config_line
   done < "$config_file"
   if [[ ! $p_relax ]]; then
-    local issues
-    if issues=$(validate_parameters); then
-      [[ $issues ]] && warn "Issues in $config_file:$issues"
-    else
+    validate_parameters; local IFS=''; local issues="${ISSUES[*]}"
+    if [[ $issues == *FATAL:* ]]; then
       fatal=fatal; [[ $p_report ]] && fatal=
       error "Found fatal issues in $config_file:$issues" $fatal blameparent
+    else
+      [[ $issues ]] && warn "Issues in $config_file:$issues"
     fi
   fi
 }
@@ -1177,8 +1178,9 @@ validate_parameters() {
     v=${PARAM_VAL[$p]}; n=${PARAM_LNO[$p]}
     # If it isn't a multivalued key, check for duplicate
     [[ ${PARAM_ATTR[$p]:-} == m* ]] || check_dup || continue
-    func_name="validate_${section//[\[\]]/}_$key"
-    declare -F "$func_name" >/dev/null && "$func_name" || add_issue $n "FATAL: Internal error - Missing function '$func_name'"
+    func_name="validate_${section}_$key"
+    declare -F "$func_name" >/dev/null || error "FATAL: Internal error - Missing function '$func_name'" fatal
+    "$func_name"
   done
   local -a missing_params=()
   for p in "${!PARAM_ATTR[@]}"; do
@@ -1187,9 +1189,7 @@ validate_parameters() {
   done
   local IFS=,
   (( ${#missing_params[@]} > 0 )) && add_issue 0 "FATAL: Missing required keys (section:key): ${missing_params[*]}"
-  IFS=''; issues="${ISSUES[*]}"
-  printf %s "$issues"
-  [[ ! $issues == *FATAL:* ]]
+  return 0
 }
 
 check_dup() {
@@ -1281,7 +1281,9 @@ validate_WGC_Bridges() {
     [[ $(ss -lntH "sport = :$ext") ]] && add_issue $n "Bridge '$name' ext. port $ext is already in use on host"
     bridges+=( "$name:$ext:$int" )
   done
-  local IFS=$'\x20'; PARAM_VAL[WGC:Bridges]="${bridges[*]}"
+  local IFS=$'\x20'
+  (( ${#bridges[*]} > 0 )) && PARAM_VAL[WGC:Bridges]="${bridges[*]}"
+  return 0
 }
 
 collect_all_ipv4() {
@@ -1300,7 +1302,7 @@ collect_all_ipv4() {
   ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
   ((f==0)) && add_issue $n "FATAL: Could not find any IPv4 address in $key"
   ((d>0))  && add_issue $n "FATAL: Found $d duplicate IPv4 addresses in $key"
-  ((b>0))  && add_issue $n "FATAL: Found $b bad IPv4 addresses in $key"
+  ((b>0))  && add_issue $n "FATAL: Found $b invalid IPv4 addresses in $key"
   return 0
 }
 
@@ -1320,7 +1322,7 @@ collect_all_ipv4_cidr() {
   ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
   ((f==0)) && add_issue $n "FATAL: Could not find any CIDR IPv4 address in $key"
   ((d>0))  && add_issue $n "FATAL: Found $d duplicate/overlapping CIDR IPv4 addresses in $key"
-  ((b>0))  && add_issue $n "FATAL: Found $b bad CIDR IPv4 addresses in $key"
+  ((b>0))  && add_issue $n "FATAL: Found $b invalid CIDR IPv4 addresses in $key"
   return 0
 }
 
@@ -1782,9 +1784,6 @@ assert_no_namespace() {
 
 # -----------------------------------------------------------------------------
 
-# Stack for cleanup functions
-declare -a CLEANUP_STACK=()
-
 # Add cleanup function to stack top
 push_cleanup() {
   local func_name="$1"
@@ -1881,8 +1880,42 @@ warn() {
 indent_multiline() {
   local -n _ref=$1
   # %% or newline means: newline and indent 2
-  _ref="${_ref//*( )@(%%|$'\n')*( )/$'\n  '}"
+  _ref="${_ref//%%/$'\n'}"
+  _ref="${_ref//$'\n'*( )/$'\n  '}"
 }
+
+_profiler() {
+  local trace_funcs fn mu=$'\u03bc'
+
+  # Get all other functions
+  trace_funcs=$(compgen -A function | grep -v "^_profiler$")
+
+  for fn in $trace_funcs; do
+    # In-memory rename each function $fn to orig_$fn
+    eval "$(declare -f "$fn" | sed "1s/^$fn[[:space:]]*()/orig_$fn ()/")"
+
+    # Wrap orig_$fn with a cronometer function $fn
+    eval "$fn() {
+      local indent start_time end_time duration ret=
+      printf -v indent '%*s' \"\${#FUNCNAME[@]}\"
+      printf '%s\n' \"\${indent}+ \${EPOCHREALTIME} \${LINENO} \${FUNCNAME[0]}() START\" >&2
+      start_time=\${EPOCHREALTIME}
+
+      # profiler overhead is about 10 μs on WSL2 running in Windows 10 running on Intel(R) Core(TM) i7-7700K CPU @ 4.20GHz
+      orig_$fn \"\$@\"; ret=\$?
+
+      end_time=\${EPOCHREALTIME}; duration=\$(( \${end_time/./} - \${start_time/./} ))
+      printf '%s\n' \"\${indent}- \${end_time} \${LINENO} \${FUNCNAME[0]}() END (Ret: \$ret) [Duration: \${duration} ${mu}s]\" >&2
+      return \$ret
+    }"
+  done
+}
+
+check_dup() {
+  return 0
+}
+# Remove # from the line below to activate function profiling
+#_profiler
 
 # -----------------------------------------------------------------------------
 [[ ${BASH_SOURCE[0]} == "$0" ]] && doit "$@"
