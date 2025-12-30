@@ -1915,7 +1915,7 @@ check_dup() {
   return 0
 }
 # Remove # from the line below to activate function profiling
-#_profiler
+_profiler
 
 # -----------------------------------------------------------------------------
 [[ ${BASH_SOURCE[0]} == "$0" ]] && doit "$@"
