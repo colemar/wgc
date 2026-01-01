@@ -79,10 +79,10 @@ doit() {
   local IPCMD; set_ipcmd; readonly IPCMD
   local HAS_NAMESPACE IN_NAMESPACE
   local -A PARAM_VAL PARAM_LNO
-  local -a PARAM_DEFS=(
-    Interface:{Address:mr,DNS:m-,MTU:--,ListenPort:--,FwMark:--,PrivateKey:-r}
-    Peer:{PublicKey:-r,PresharedKey:--,Endpoint:-r,AllowedIPs:mr,PersistentKeepalive:--}
-    WGC:Bridges:m-
+  local -a PARAM_DEFS=( # mrs: Multivalued Required Secret
+    Interface:{Address:mr-,DNS:m--,MTU:---,ListenPort:---,FwMark:---,PrivateKey:-rs}
+    Peer:{PublicKey:-r-,PresharedKey:--s,Endpoint:-r-,AllowedIPs:mr-,PersistentKeepalive:---}
+    WGC:Bridges:m--
   )
   local -a PARAMS
   local -A PARAM_ATTR SECTIONS
@@ -499,7 +499,7 @@ configure_vpn_plain() {
   # Configure interface $DEV
   ip link set $DEV mtu ${PARAM_VAL[MTU]} :"Failed to configure MTU '${PARAM_VAL[MTU]}' for interface '$DEV'"
 
-  local addr IFS=$'\x20'
+  local addr IFS=,
   for addr in ${PARAM_VAL[Interface:Address]}; do
     ip addr add "$addr" dev $DEV :"Failed to configure address '$addr' for interface '$DEV'"
   done
@@ -519,7 +519,7 @@ configure_vpn_plain() {
 
   if [[ $CMD == @(up|fup|bupd) && -v PARAM_VAL[Interface:DNS] ]]; then
     # We have have at least one valid nameserver ip. Configure DNS.
-    local k= q= IFS=$'\x20'
+    local k= q= IFS=,
     for k in ${PARAM_VAL[Interface:DNS]}; do
       q+="nameserver $k"$'\n'
       [[ $CMD == bupd ]] && { ip route add "$k" dev "$DEV" || warn "Cannot add route to nameserver $k"; }
@@ -534,12 +534,8 @@ configure_vpn_plain() {
 }
 
 check_dns_reachability() {
-  IFS=$'\x20' read -ra dns_servers <<< "$1"
-
-  local nsip route_info current_dev
-  local dns_warnings=
-
-  for nsip in "${dns_servers[@]}"; do
+  local nsip route_info current_dev dns_warnings= IFS=,
+  for nsip in ${PARAM_VAL[Interface:DNS]};do
     if route_info=$(ip route get "$nsip" 2>/dev/null); then
       if [[ $route_info != *"dev $DEV"* ]]; then
         if [[ $route_info =~ dev\ ([^[:space:]]+) ]]; then
@@ -547,7 +543,7 @@ check_dns_reachability() {
         else
           current_dev="unknown"
         fi
-        dns_warnings+=$'\n'"- LEAK: $nsip is routed via '$current_dev' (not VPN tunnel)."
+        dns_warnings+=$'\n'"- LEAK: $nsip is routed via '$current_dev' instead of VPN tunnel."
       fi
     else
       dns_warnings+=$'\n'"- UNREACHABLE: No route found for $nsip."
@@ -590,7 +586,7 @@ set_source_routing() {
   done
   ((t > 51999)) && error "Could not find an empty routing table in the range 51820..51999" fatal
   ip route add default dev $DEV table $t :"Could not add default route via $DEV in table $t"
-  local addr IFS=$'\x20'
+  local addr IFS=,
   for addr in ${PARAM_VAL[Interface:Address]}; do
     ip rule add from ${addr%/*} table $t :"Could not add source routing rule for ip address ${addr%/*}"
   done
@@ -631,7 +627,7 @@ configure_vpn_in_namespace() {
   ip netns exec $NAMESPACE ip link set lo up :"Failed to bring up loopback interface in namespace '$NAMESPACE'"
   # Configure interface $DEV
   ip netns exec $NAMESPACE ip link set $DEV mtu $MTU :"Failed to configure MTU '$MTU' for interface '$DEV'"
-  local addr IFS=$'\x20'
+  local addr IFS=,
   for addr in ${PARAM_VAL[Interface:Address]}; do
     ip netns exec $NAMESPACE ip addr add "$addr" dev $DEV :"Failed to configure address '$addr' for interface '$DEV'"
   done
@@ -641,7 +637,7 @@ configure_vpn_in_namespace() {
   ip netns exec $NAMESPACE ip route add default dev $DEV :"Could not add default route via $DEV in namespace $NAMESPACE"
   # Configure DNS
   if mkdir -p /etc/netns/$NAMESPACE; then
-    local k IFS=$'\x20'
+    local k IFS=,
     for k in ${PARAM_VAL[Interface:DNS]}; do
       echo "nameserver $k"
     done > /etc/netns/$NAMESPACE/resolv.conf
@@ -678,7 +674,7 @@ configure_vpn_in_namespace() {
       done
       [[ -e $netns_path ]] || error "Cannot locate netns file for '$NAMESPACE'" fatal
 
-      local b b_name b_ext b_int b_sock b_unit_int b_unit_ext IFS=$'\x20'
+      local b b_name b_ext b_int b_sock b_unit_int b_unit_ext IFS=,
       for b in ${PARAM_VAL[WGC:Bridges]}; do
         IFS=: read -r b_name b_ext b_int <<< "$b"
 
@@ -1020,7 +1016,7 @@ show_active_vpns() {
 }
 
 list_config_files() {
-  local f= g= Endpoint Address AllowedIPs
+  local f= g= Endpoint Address AllowedIPs IFS=, b=()
   echo -e "Looking in $CFGDIR\n"
   prc "+W%-12s %-4s %-18s %-29s %s+/\n" Name Br. Address Endpoint AllowedIPs
   prc "+A%-12s %-4s %-18s %-29s %s+/\n" ---- --- ------- -------- ----------
@@ -1031,10 +1027,10 @@ list_config_files() {
     [[ $g =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
     parse_config_file "$g" bridges relax || continue
     Endpoint=${PARAM_VAL[Peer:Endpoint]}
-    Address=${PARAM_VAL[Interface:Address]%%$'\x20'*}
+    Address=${PARAM_VAL[Interface:Address]%%,*}
     AllowedIPs=${PARAM_VAL[Peer:AllowedIPs]}
     (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
-    local b=( ${PARAM_VAL[WGC:Bridges]:-} )
+    b=(); [[ -v PARAM_VAL[WGC/Bridges] ]] && b=( ${PARAM_VAL[WGC:Bridges]} )
     prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#b[@]} "$Address" "$Endpoint" "$AllowedIPs"
   done
 }
@@ -1058,13 +1054,15 @@ show_config() {
   echo
   prc "+W%-20s%s+/\n" Key  Value
   prc "+A%-20s%s+/\n"     ---- -----
-  local v val missing pub
+  local last_section= section key v val missing pub
   for p in "${PARAMS[@]}"; do
     IFS=: read -r section key <<< "$p"
+    [[ $section != "$last_section" ]] && prc "+g%s+/\n" "[$section]"
+    last_section=$section
     v=; val="(missing)"; missing=1
     [[ -v PARAM_VAL[$p] ]] && { v=${PARAM_VAL[$p]}; val=$v; missing=; }
-    [[ $p == "Interface:PrivateKey" && ! $missing ]] && val="<HIDDEN>"
-    prc "+c%-20s+/${missing:++Y}%s+/" $p "$val"
+    [[ ${PARAM_ATTR[$p]:-} == ??s* && ! $missing ]] && val="<HIDDEN>"
+    prc "+c%-20s+/${missing:++Y}%s+/" $key "$val"
     if [[ $p == *:P*Key && ! $missing ]]; then
       if pub=$(get_public_key "$v"); then
         [[ $p == "Interface:PrivateKey" ]] && prc "\n+A└── %-15s+/ %s" "PUBLIC" "$pub"
@@ -1075,12 +1073,11 @@ show_config() {
     [[ $missing && ${PARAM_ATTR[$p]:-} == ?r* ]] && prc " $W +R%s+/" required
     printf "\n"
   done
-  return 0
-  if [[ -v PARAM_VAL[WGC:Bridges] ]]; then
+  if [[ -v PARAM_VAL[WGC/Bridges] ]]; then
     echo
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
     prc "+A%-20s%s+/\n"  -----------------   ------------------
-    local b b_name b_ext b_int IFS=$'\x20'
+    local b b_name b_ext b_int IFS=,
     for b in ${PARAM_VAL[WGC:Bridges]}; do
       IFS=: read -r b_name b_ext b_int <<< "$b"
       prc "+y%-19s+/ %s +A%s+/ %s\n" "$b_name" "$b_ext" "->" "$b_int"
@@ -1101,7 +1098,8 @@ parse_config_file() {
 
   local line n=0 section= key value
   local -A SEEN_SECTIONS=()
-  local -a ISSUES=()
+  local ISSUES=() HAS_FATAL_ISSUE=
+  PARAM_VAL=() PARAM_LNO=()
   while read -r line || [[ $line ]]; do # also read last line if \n is missing
       ((++n))
       line=${line%%#*} # Remove comments
@@ -1110,14 +1108,14 @@ parse_config_file() {
         # This line is a section.
         section=${BASH_REMATCH[1]} # Track section
         if ! [[ -v SECTIONS[$section] ]]; then
-          add_issue $n "Unknown section [$section]"
+          add_issue "$n" "Unknown section [$section]"
           section=BADSECTION
           continue
         fi
         # Section is valid.
         # If section was seen before, mark it as bad...
         if [[ -v SEEN_SECTIONS[$section] ]]; then
-          add_issue $n "Ignored duplicate section [$section]"
+          add_issue "$n" "Ignored duplicate section [$section]"
           section=BADSECTION
           continue
         fi
@@ -1129,7 +1127,7 @@ parse_config_file() {
       # Skip lines in bad sections (even before all sections)
       case "$section" in
         BADSECTION) continue ;;
-        "") add_issue $n "Ignored data before sections"
+        "") add_issue "$n" "Ignored data before sections"
             section=BADSECTION; continue ;;
       esac
       # Parse key=value with flexible spacing
@@ -1137,35 +1135,39 @@ parse_config_file() {
         key=${BASH_REMATCH[1]}   # trimmed, alphanumeric
         value=${BASH_REMATCH[2]} # trimmed, no leading or trailing commas
       else # Not a key=value line
-        add_issue $n "Malformed line in section [$section]"
+        add_issue "$n" "Malformed line in section [$section]"
         continue
       fi
       # Get values according to section/key
       process_config_line
   done < "$config_file"
+  validate_parameters
   if [[ ! $p_relax ]]; then
-    validate_parameters; local IFS=''; local issues="${ISSUES[*]}"
-    if [[ $issues == *FATAL:* ]]; then
+    local IFS=''
+    if [[ $HAS_FATAL_ISSUE ]]; then
       fatal=fatal; [[ $p_report ]] && fatal=
-      error "Found fatal issues in $config_file:$issues" $fatal blameparent
+      error "Found fatal issues in $config_file:${ISSUES[*]}" $fatal blameparent
     else
-      [[ $issues ]] && warn "Issues in $config_file:$issues"
+      (( ${#ISSUES[*]} > 0 )) && warn "Issues in $config_file:${ISSUES[*]}"
     fi
   fi
+  return 0
 }
 
 add_issue() {
-  local n=$1 msg=$2.
+  local n=$1 msg=$2
   local first_n=${n%%,*}
   # Prefix the message with the line number (e.g., "10: Message")
   # Join with newline if multiple issues exist for the same line index
-  ISSUES[first_n]+=$'\n'"$n: $msg"
+  ISSUES[first_n]+=$'\n'"$n: $msg."
+  [[ $msg == FATAL:* ]] && HAS_FATAL_ISSUE=1
+  return 0
 }
 
 process_config_line() {
   [[ $section == WGC && -z $p_bridges ]] && return 0
   local k=$section:$key comma=${PARAM_LNO[$section:$key]:+,}
-  [[ -v PARAM_ATTR[$k] ]] || { add_issue $n "Found unknown key '$key' in section [$section]"; return 0; }
+  [[ -v PARAM_ATTR[$k] ]] || { add_issue "$n" "Found unknown key '$key' in section [$section]"; return 0; }
   PARAM_VAL[$k]+=$comma$value
   PARAM_LNO[$k]+=$comma$n
   return 0
@@ -1194,95 +1196,96 @@ validate_parameters() {
 
 check_dup() {
   [[ $n == *,* ]] || return 0
-  add_issue $n "FATAL: Duplicated key '$key' in section [$section]"
+  add_issue "$n" "FATAL: Duplicated key '$key' in section [$section]"
   return 1
 }
 
 validate_Interface_Address() {
-  collect_all_ipv4_cidr $'\x20'
+  collect_all_ipv4_cidr ,
 }
 
 validate_Interface_DNS() {
-  collect_all_ipv4 $'\x20'
+  collect_all_ipv4 ,
 }
 
 validate_Interface_MTU() {
   # min 576 for IPv4, min 1280 for IPv6
   [[ $v =~ ^([1-9][0-9]{2,4})$ ]] && (( v >= 576 && v <= 65535 )) && return 0
-  add_issue $n "FATAL: Invalid $key value '$v' (must be 576-65535)"
+  add_issue "$n" "FATAL: Invalid $key value '$v' (must be 576-65535)"
 }
 
 validate_Interface_PrivateKey() {
   is_valid_key "$v" && return 0
-  add_issue $n "FATAL: Invalid $key value"
+  add_issue "$n" "FATAL: Invalid $key value"
 }
 
 validate_Interface_ListenPort() {
-  is_valid_port "$v" || { add_issue $n "FATAL: Invalid $key value '$v' (must be 1-65535)"; return 0; }
-  [[ $(ss -lnuH "sport = :$v") ]] && add_issue $n "FATAL: UDP port '$v' is already used."
+  is_valid_port "$v" || { add_issue "$n" "FATAL: Invalid $key value '$v' (must be 1-65535)"; return 0; }
+  [[ $(ss -lnuH "sport = :$v") ]] && add_issue "$n" "FATAL: UDP port '$v' is already used"
   return 0
 }
 
 validate_Interface_FwMark() {
-  [[ $1 == off || $1 =~ ^(0x[[:xdigit:]]{1,8}|0|[1-9][0-9]{0,9})$ && $1 -le 0xFFFFFFFF ]] && return 0
-  add_issue $n "FATAL: Invalid $key value '$v' (must be 0-4294967295 0x0-0xFFFFFFFF)"
+  [[ $v == off || $v =~ ^(0x[[:xdigit:]]{1,8}|0|[1-9][0-9]{0,9})$ && $v -le 0xFFFFFFFF ]] && return 0
+  add_issue "$n" "FATAL: Invalid $key value '$v' (must be 0-4294967295 0x0-0xFFFFFFFF)"
 }
 
 validate_Peer_AllowedIPs() {
-  collect_all_ipv4_cidr ","
+  collect_all_ipv4_cidr ,
 }
 
 validate_Peer_Endpoint() {
-  [[ ! $v =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]] && { add_issue $n "FATAL: Invalid $key value '$v'"; return 0; }
+  [[ ! $v =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]] && { add_issue "$n" "FATAL: Invalid $key value '$v'"; return 0; }
   local host=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
-  is_valid_port "$port" || add_issue $n "FATAL: Invalid $key port '$port'"
+  is_valid_port "$port" || add_issue "$n" "FATAL: Invalid $key port '$port'"
   if ! is_valid_ipv4 "$host"; then
     local ip
-    read -r ip _ < <(getent ahostsv4 "$host") || true
-    [[ $ip ]] && host=$ip || add_issue $n "FATAL: Could not resolve $key host '$host'"
-  else
-    PARAM_VAL[$p]="$host:$port"
+    read -r ip _ < <(getent ahostsv4 "$host" || true) || true
+    is_valid_ipv4 "$ip" && host=$ip || add_issue "$n" "FATAL: Could not resolve $key host '$host'"
   fi
+  PARAM_VAL[$p]="$host:$port"
   return 0
 }
 
 validate_Peer_PersistentKeepalive() {
   [[ $v =~ ^([1-9][0-9]{0,4}|0)$ ]] && (( v <= 65535 )) && return 0
-  add_issue $n "FATAL: Invalid $key value, must be 0-65535"
+  add_issue "$n" "FATAL: Invalid $key value '$v', must be 0-65535"
 }
 
 validate_Peer_PresharedKey() {
-  validate_Peer_PublicKey
+  validate_Interface_PrivateKey
 }
 
 validate_Peer_PublicKey()  {
   is_valid_key "$v" && return 0
-  add_issue $n "FATAL: Invalid $key value '$v'"
+  add_issue "$n" "FATAL: Invalid $key value '$v'"
 }
 
 validate_WGC_Bridges() {
-  local bridge name ext int
+  local bridge name ext int c=0 IFS=$'\x20'
   local -A seen_names=() seen_ext_ports=()
   local -a bridges=()
 
   for bridge in ${v//,/ }; do
+    ((++c))
     [[ $bridge =~ ^([a-zA-Z][a-zA-Z0-9_-]*):([0-9]+):([0-9]+)$ ]] || \
-      { add_issue $n "FATAL: Invalid bridge '$bridge'. Format must be <name>:<number>:<number>"; continue; }
+      { add_issue "$n" "FATAL: Invalid bridge '$bridge'. Format must be <name>:<number>:<number>"; continue; }
     name=${BASH_REMATCH[1]}; ext=${BASH_REMATCH[2]}; int=${BASH_REMATCH[3]}
-    [[ -v seen_names[$name] ]] && { add_issue $n "FATAL: Duplicate bridge name '$name' in Bridges list"; continue; }
+    [[ -v seen_names[$name] ]] && { add_issue "$n" "FATAL: Duplicate bridge name '$name' in Bridges list"; continue; }
     seen_names[$name]=1
     local pok=1
-    is_valid_port "$ext" || { add_issue $n "FATAL: Bridge '$name' has invalid external port '$ext', must be 1-65535"; pok=; }
-    is_valid_port "$int" || { add_issue $n "FATAL: Bridge '$name' has invalid internal port '$int', must be 1-65535"; pok=; }
+    is_valid_port "$ext" || { add_issue "$n" "FATAL: Bridge '$name' has invalid external port '$ext', must be 1-65535"; pok=; }
+    is_valid_port "$int" || { add_issue "$n" "FATAL: Bridge '$name' has invalid internal port '$int', must be 1-65535"; pok=; }
     [[ $pok ]] || continue
     [[ -v seen_ext_ports[$ext] ]] && \
-      { add_issue $n "FATAL: Bridge '$name' ext. port $ext conflicting with bridge '${seen_ext_ports[$ext]}'"; continue; }
+      { add_issue "$n" "FATAL: Bridge '$name' ext. port $ext conflicting with bridge '${seen_ext_ports[$ext]}'"; continue; }
     seen_ext_ports[$ext]=$name
-    [[ $(ss -lntH "sport = :$ext") ]] && add_issue $n "Bridge '$name' ext. port $ext is already in use on host"
+    [[ $(ss -lntH "sport = :$ext") ]] && add_issue "$n" "FATAL: Bridge '$name' ext. port $ext is already in use on host"
     bridges+=( "$name:$ext:$int" )
   done
-  local IFS=$'\x20'
-  (( ${#bridges[*]} > 0 )) && PARAM_VAL[WGC:Bridges]="${bridges[*]}"
+  (( c==0 || c > ${#bridges[*]} )) && return 0
+  local IFS=,; PARAM_VAL[WGC:Bridges]="${bridges[*]}"
+  PARAM_VAL[WGC/Bridges]=1 # Means WGC:Bridges is valid
   return 0
 }
 
@@ -1300,9 +1303,9 @@ collect_all_ipv4() {
   done
   IFS=$sep
   ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
-  ((f==0)) && add_issue $n "FATAL: Could not find any IPv4 address in $key"
-  ((d>0))  && add_issue $n "FATAL: Found $d duplicate IPv4 addresses in $key"
-  ((b>0))  && add_issue $n "FATAL: Found $b invalid IPv4 addresses in $key"
+  ((f==0)) && add_issue "$n" "FATAL: Could not find any IPv4 address in $key"
+  ((d>0))  && add_issue "$n" "FATAL: Found $d duplicate IPv4 addresses in $key"
+  ((b>0))  && add_issue "$n" "FATAL: Found $b invalid IPv4 addresses in $key"
   return 0
 }
 
@@ -1320,9 +1323,9 @@ collect_all_ipv4_cidr() {
   done
   IFS=$sep
   ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
-  ((f==0)) && add_issue $n "FATAL: Could not find any CIDR IPv4 address in $key"
-  ((d>0))  && add_issue $n "FATAL: Found $d duplicate/overlapping CIDR IPv4 addresses in $key"
-  ((b>0))  && add_issue $n "FATAL: Found $b invalid CIDR IPv4 addresses in $key"
+  ((f==0)) && add_issue "$n" "FATAL: Could not find any CIDR IPv4 address in $key"
+  ((d>0))  && add_issue "$n" "FATAL: Found $d duplicate/overlapping CIDR IPv4 addresses in $key"
+  ((b>0))  && add_issue "$n" "FATAL: Found $b invalid CIDR IPv4 addresses in $key"
   return 0
 }
 
@@ -1334,7 +1337,7 @@ is_valid_ipv4() {
   # [1-9]?[0-9] -> 0-99
   local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
   local regex="^$oct\.$oct\.$oct\.$oct$"
-  [[ $1 =~ $regex ]]
+  [[ ${1:-} =~ $regex ]]
 }
 
 is_valid_ipv4_cidr() {
@@ -1342,7 +1345,7 @@ is_valid_ipv4_cidr() {
   # 3[012]      -> 30-32
   local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
   local regex="^$oct\.$oct\.$oct\.$oct(/([1-2]?[0-9]|3[012]))?$"
-  [[ $1 =~ $regex ]]
+  [[ ${1:-} =~ $regex ]]
 }
 
 is_valid_port() {
@@ -1877,11 +1880,18 @@ warn() {
   echo "$W Warning: $msg" >&2
 }
 
-indent_multiline() {
+indent_multiline() { # 771 μs
   local -n _ref=$1
-  # %% or newline means: newline and indent 2
-  _ref="${_ref//%%/$'\n'}"
-  _ref="${_ref//$'\n'*( )/$'\n  '}"
+  local -a lines
+  local i
+
+  mapfile -t lines <<< "${_ref//%%/$'\n'}"
+
+  for ((i=1; i < ${#lines[@]}; i++)); do
+    lines[i]="  ${lines[i]#${lines[i]%%[![:space:]]*}}"
+  done
+
+  local IFS=$'\n'; _ref="${lines[*]}"
 }
 
 _profiler() {
@@ -1911,11 +1921,8 @@ _profiler() {
   done
 }
 
-check_dup() {
-  return 0
-}
 # Remove # from the line below to activate function profiling
-_profiler
+#_profiler
 
 # -----------------------------------------------------------------------------
 [[ ${BASH_SOURCE[0]} == "$0" ]] && doit "$@"
