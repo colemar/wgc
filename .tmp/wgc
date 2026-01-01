@@ -223,7 +223,6 @@ acquire_lock() {
   local id=$1 msg=$2 lock_file="/var/run/wgc.${id}.lock" fd
 
   exec {lock_fd}>"$lock_file" || error "Cannot create lock file: $lock_file" fatal blameparent
-  flock -n $fd || { exec {lock_fd}>&-; return 1; }
   if ! flock -n $fd; then
     exec {lock_fd}>&-
     error "Another wgc instance is $msg. Try again in a moment." fatal blameparent
