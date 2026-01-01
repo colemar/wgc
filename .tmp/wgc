@@ -684,12 +684,6 @@ start_bridges() {
       b_unit_int=wgc.$VPN.$b_name.int
       b_unit_ext=wgc.$VPN.$b_name.ext
 
-      # Is external port available for listen?
-      if [[ $(ss -lntH "sport = :$b_ext") ]] ; then
-        warn "Cannot start bridge '$b_name': External port $b_ext is already in use on host."
-        continue
-      fi
-
       prc "+y%-20s +G%-7s +A%-2s +c%s+/\n" "$b_name" "$b_ext" "->" "$b_int"
 
       if [[ $PROXYD_BIN ]]; then # use systemd-socket-proxyd
@@ -702,7 +696,7 @@ start_bridges() {
         # 2. Start External Listener
         start_transient_service "$b_unit_ext" \
           --description="WGC Listener (proxyd) '$b_name' $b_ext -> $b_int" \
-          --socket-property=ListenStream=$b_ext \
+          --socket-property=ListenStream=0.0.0.0:$b_ext \
           --property=After=$b_unit_int.service \
           --property=BindsTo=$b_unit_int.service \
           $PROXYD_BIN "$b_sock"
@@ -1222,7 +1216,8 @@ validate_Interface_PrivateKey() {
 
 validate_Interface_ListenPort() {
   is_valid_port "$v" || { add_issue "$n" "FATAL: Invalid $key value '$v' (must be 1-65535)"; return 0; }
-  [[ $(ss -lnuH "sport = :$v") ]] && add_issue "$n" "FATAL: UDP port '$v' is already used"
+  local info
+  check_udp_port_usage "$v" info || add_issue "$n" "FATAL: UDP port '$v' is already used${info:+ by $info}"
   return 0
 }
 
@@ -1263,9 +1258,8 @@ validate_Peer_PublicKey()  {
 }
 
 validate_WGC_Bridges() {
-  local bridge name ext int c=0 IFS=$'\x20'
+  local bridge name ext int c=0 bridges=() IFS=$'\x20'
   local -A seen_names=() seen_ext_ports=()
-  local -a bridges=()
 
   for bridge in ${v//,/ }; do
     ((++c))
@@ -1281,7 +1275,8 @@ validate_WGC_Bridges() {
     [[ -v seen_ext_ports[$ext] ]] && \
       { add_issue "$n" "FATAL: Bridge '$name' ext. port $ext conflicting with bridge '${seen_ext_ports[$ext]}'"; continue; }
     seen_ext_ports[$ext]=$name
-    [[ $(ss -lntH "sport = :$ext") ]] && add_issue "$n" "FATAL: Bridge '$name' ext. port $ext is already in use on host"
+    local info; check_tcp4_port_usage "$ext" info || \
+      add_issue "$n" "FATAL: Bridge '$name' ext. port $ext is already in use${info:+ by $info}"
     bridges+=( "$name:$ext:$int" )
   done
   (( c==0 || c > ${#bridges[*]} )) && return 0
@@ -1352,6 +1347,28 @@ is_valid_ipv4_cidr() {
 is_valid_port() {
   local p=$1
   [[ $p =~ ^(0|[1-9][0-9]*)$ ]] && ((p >= 1 && p <= 65535))
+}
+
+check_udp_port_usage() {
+  local -n _process_info=$2
+  local _ss_out=$(ss -lunHp "sport = :$1")
+  _process_info=
+  if [[ $_ss_out ]]; then
+    [[ ${_ss_out%%$'\n'*} =~ users:\(\(.*\)\) ]] && _process_info=${BASH_REMATCH[0]}
+    return 1
+  fi
+  return 0
+}
+
+check_tcp4_port_usage() {
+  local -n _process_info=$2
+  local _ss_out=$(ss -4ltnHp "sport = :$1")
+  _process_info=
+  if [[ $_ss_out ]]; then
+    [[ ${_ss_out%%$'\n'*} =~ users:\(\(.*\)\) ]] && _process_info=${BASH_REMATCH[0]}
+    return 1
+  fi
+  return 0
 }
 
 is_valid_key() {
