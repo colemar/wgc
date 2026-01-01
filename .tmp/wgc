@@ -626,7 +626,7 @@ configure_vpn_in_namespace() {
   ip link set $DEV netns $NAMESPACE :"Failed to move interface '$DEV' to namespace '$NAMESPACE'"
   ip netns exec $NAMESPACE ip link set lo up :"Failed to bring up loopback interface in namespace '$NAMESPACE'"
   # Configure interface $DEV
-  ip netns exec $NAMESPACE ip link set $DEV mtu $MTU :"Failed to configure MTU '$MTU' for interface '$DEV'"
+  ip netns exec $NAMESPACE ip link set $DEV mtu ${PARAM_VAL[MTU]} :"Failed to configure MTU '${PARAM_VAL[MTU]} for interface '$DEV'"
   local addr IFS=,
   for addr in ${PARAM_VAL[Interface:Address]}; do
     ip netns exec $NAMESPACE ip addr add "$addr" dev $DEV :"Failed to configure address '$addr' for interface '$DEV'"
@@ -650,91 +650,92 @@ configure_vpn_in_namespace() {
   fi
 
   # Start proxyd/socat bridges
-  if [[ -v PARAM_VAL[WGC:Bridges] ]]; then
+  [[ -v PARAM_VAL[WGC:Bridges] ]] && start_bridges
+}
 
-    local PROXYD_BIN
-    for PROXYD_BIN in /lib/systemd/systemd-socket-proxyd /usr/lib/systemd/systemd-socket-proxyd ""; do
-      [[ -x $PROXYD_BIN ]] && break
+start_bridges() {
+  local PROXYD_BIN
+  for PROXYD_BIN in /lib/systemd/systemd-socket-proxyd /usr/lib/systemd/systemd-socket-proxyd ""; do
+    [[ -x $PROXYD_BIN ]] && break
+  done
+  [[ $PROXYD_BIN ]] || warn "systemd-socket-proxyd not found, falling back to socat"
+
+  if [[ ! $PROXYD_BIN ]] && ! command -v socat >/dev/null; then
+
+    warn "socat not found: cannot start bridges defined in [WGC-Bridges]"
+
+  else
+
+    echo "Starting Port Forwarding Bridges:"
+    prc "+W%-20s %s+/\n" "Bridge" "ExtPort -> IntPort"
+    prc "+A%-20s %s+/\n" "------" "------------------"
+
+    local netns_path
+    for netns_path in /run/netns/$NAMESPACE /var/run/netns/$NAMESPACE ""; do
+      [[  -e $netns_path ]] && break
     done
-    [[ $PROXYD_BIN ]] || warn "systemd-socket-proxyd not found, falling back to socat"
+    [[ -e $netns_path ]] || error "Cannot locate netns file for '$NAMESPACE'" fatal
 
-    if [[ ! $PROXYD_BIN ]] && ! command -v socat >/dev/null; then
+    local b b_name b_ext b_int b_sock b_unit_int b_unit_ext IFS=,
+    for b in ${PARAM_VAL[WGC:Bridges]}; do
+      IFS=: read -r b_name b_ext b_int <<< "$b"
 
-      warn "socat not found: cannot start bridges defined in [WGC-Bridges]"
+      b_sock=/run/wgc.$VPN.$b_name.sock
+      b_unit_int=wgc.$VPN.$b_name.int
+      b_unit_ext=wgc.$VPN.$b_name.ext
 
-    else
+      # Is external port available for listen?
+      if [[ $(ss -lntH "sport = :$b_ext") ]] ; then
+        warn "Cannot start bridge '$b_name': External port $b_ext is already in use on host."
+        continue
+      fi
 
-      echo "Starting Port Forwarding Bridges:"
-      prc "+W%-20s %s+/\n" "Bridge" "ExtPort -> IntPort"
-      prc "+A%-20s %s+/\n" "------" "------------------"
+      prc "+y%-20s +G%-7s +A%-2s +c%s+/\n" "$b_name" "$b_ext" "->" "$b_int"
 
-      local netns_path
-      for netns_path in /run/netns/$NAMESPACE /var/run/netns/$NAMESPACE ""; do
-        [[  -e $netns_path ]] && break
+      if [[ $PROXYD_BIN ]]; then # use systemd-socket-proxyd
+        # 1. Start Internal Connector
+        start_transient_service "$b_unit_int" \
+          --description="WGC Connector (proxyd) '$b_name' to port $b_int" \
+          --socket-property=ListenStream="$b_sock" \
+          --property=NetworkNamespacePath=$netns_path \
+          $PROXYD_BIN 127.0.0.1:$b_int
+        # 2. Start External Listener
+        start_transient_service "$b_unit_ext" \
+          --description="WGC Listener (proxyd) '$b_name' $b_ext -> $b_int" \
+          --socket-property=ListenStream=$b_ext \
+          --property=After=$b_unit_int.service \
+          --property=BindsTo=$b_unit_int.service \
+          $PROXYD_BIN "$b_sock"
+      else # use socat
+        # 1. Start Internal Connector
+        start_transient_service "$b_unit_int" \
+          --description="WGC Connector (socat) '$b_name' to port $b_int" \
+          ip netns exec $NAMESPACE \
+          socat UNIX-LISTEN:"$b_sock",fork,reuseaddr,unlink-early,mode=600,max-children=50 TCP:127.0.0.1:$b_int,tcp-nodelay
+        # 2. Start External Listener
+        start_transient_service "$b_unit_ext" \
+          --description="WGC Listener (socat) '$b_name' $b_ext -> $b_int" \
+          --property=After=$b_unit_int.service \
+          --property=BindsTo=$b_unit_int.service \
+          socat TCP-LISTEN:$b_ext,fork,reuseaddr,tcp-nodelay UNIX-CONNECT:"$b_sock"
+      fi
+
+      # 3. Health check
+      local unit_to_check="$b_unit_ext.service"
+      [[ $PROXYD_BIN ]] && unit_to_check="${b_unit_ext}.socket"
+      local retries=20 # 2 seconds total
+      while ((retries-- > 0)); do
+        sleep 0.1
+        systemctl is-active --quiet "$unit_to_check" && break
       done
-      [[ -e $netns_path ]] || error "Cannot locate netns file for '$NAMESPACE'" fatal
+      if ((retries < 0)); then
+        local status=$(systemctl is-active "$unit_to_check" 2>/dev/null)
+        warn "Bridge '$b_name' failed to start (status: ${status:-unknown}).
+              Check logs: journalctl -u $unit_to_check"
+      fi
 
-      local b b_name b_ext b_int b_sock b_unit_int b_unit_ext IFS=,
-      for b in ${PARAM_VAL[WGC:Bridges]}; do
-        IFS=: read -r b_name b_ext b_int <<< "$b"
-
-        b_sock=/run/wgc.$VPN.$b_name.sock
-        b_unit_int=wgc.$VPN.$b_name.int
-        b_unit_ext=wgc.$VPN.$b_name.ext
-
-        # Is external port available for listen?
-        if [[ $(ss -lntH "sport = :$b_ext") ]] ; then
-          warn "Cannot start bridge '$b_name': External port $b_ext is already in use on host."
-          continue
-        fi
-
-        prc "+y%-20s +G%-7s +A%-2s +c%s+/\n" "$b_name" "$b_ext" "->" "$b_int"
-
-        if [[ $PROXYD_BIN ]]; then # use systemd-socket-proxyd
-          # 1. Start Internal Connector
-          start_transient_service "$b_unit_int" \
-            --description="WGC Connector (proxyd) '$b_name' to port $b_int" \
-            --socket-property=ListenStream="$b_sock" \
-            --property=NetworkNamespacePath=$netns_path \
-            $PROXYD_BIN 127.0.0.1:$b_int
-          # 2. Start External Listener
-          start_transient_service "$b_unit_ext" \
-            --description="WGC Listener (proxyd) '$b_name' $b_ext -> $b_int" \
-            --socket-property=ListenStream=$b_ext \
-            --property=After=$b_unit_int.service \
-            --property=BindsTo=$b_unit_int.service \
-            $PROXYD_BIN "$b_sock"
-        else # use socat
-          # 1. Start Internal Connector
-          start_transient_service "$b_unit_int" \
-            --description="WGC Connector (socat) '$b_name' to port $b_int" \
-            ip netns exec $NAMESPACE \
-            socat UNIX-LISTEN:"$b_sock",fork,reuseaddr,unlink-early,mode=600,max-children=50 TCP:127.0.0.1:$b_int,tcp-nodelay
-          # 2. Start External Listener
-          start_transient_service "$b_unit_ext" \
-            --description="WGC Listener (socat) '$b_name' $b_ext -> $b_int" \
-            --property=After=$b_unit_int.service \
-            --property=BindsTo=$b_unit_int.service \
-            socat TCP-LISTEN:$b_ext,fork,reuseaddr,tcp-nodelay UNIX-CONNECT:"$b_sock"
-        fi
-
-        # 3. Health check
-        local unit_to_check="$b_unit_ext.service"
-        [[ $PROXYD_BIN ]] && unit_to_check="${b_unit_ext}.socket"
-        local retries=20 # 2 seconds total
-        while ((retries-- > 0)); do
-          sleep 0.1
-          systemctl is-active --quiet "$unit_to_check" && break
-        done
-        if ((retries < 0)); then
-          local status=$(systemctl is-active "$unit_to_check" 2>/dev/null)
-          warn "Bridge '$b_name' failed to start (status: ${status:-unknown}).
-                Check logs: journalctl -u $unit_to_check"
-        fi
-
-      done
-      echo
-    fi
+    done
+    echo
   fi
 }
 
@@ -1166,10 +1167,10 @@ add_issue() {
 
 process_config_line() {
   [[ $section == WGC && -z $p_bridges ]] && return 0
-  local k=$section:$key comma=${PARAM_LNO[$section:$key]:+,}
-  [[ -v PARAM_ATTR[$k] ]] || { add_issue "$n" "Found unknown key '$key' in section [$section]"; return 0; }
-  PARAM_VAL[$k]+=$comma$value
-  PARAM_LNO[$k]+=$comma$n
+  local p=$section:$key comma=${PARAM_LNO[$section:$key]:+,}
+  [[ -v PARAM_ATTR[$p] ]] || { add_issue "$n" "Found unknown key '$key' in section [$section]"; return 0; }
+  PARAM_VAL[$p]+=$comma$value
+  PARAM_LNO[$p]+=$comma$n
   return 0
 }
 
