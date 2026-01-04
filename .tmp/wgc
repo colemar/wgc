@@ -59,9 +59,9 @@ doit() {
   set -o noglob      # Disable globbing (enable it later temporarily if needed)
   set -o errexit   # Exit immediately if a command exits with a non-zero status.
   set -o errtrace  # Trap ERR is inherited by functions.
-  trap 'error TRAP-ERR fatal' ERR
-  trap 'error TRAP-INT fatal' INT
-  trap 'error TRAP-TERM fatal' TERM
+  trap 'error TRAP-ERR' ERR
+  trap 'error TRAP-INT' INT
+  trap 'error TRAP-TERM' TERM
   shopt -s extglob   # Enable extended glob patterns: x(y)
   shopt -s nullglob  # Patterns which match no files expand to a null string
   shopt -s checkwinsize extquote
@@ -220,7 +220,8 @@ printf "\n%s\n\n" "$usage"
 }
 
 acquire_lock() {
-  local id=$1 msg=$2 lock_file="/var/run/wgc.${id}.lock" fd
+  local id=$1 msg=$2
+  local lock_file="/var/run/wgc.${id}.lock" fd
 
   exec {fd}>"$lock_file" || error "Cannot create lock file: $lock_file" fatal blameparent
   if ! flock -n $fd; then
@@ -477,17 +478,26 @@ start_vpn() {
 
   # Configure WireGuard
   # Notice: this was tested against possible attack vectors, do not modify the general approach!
-  wadd() { [[ -v PARAM_VAL[$1] ]] && wgcmd+=" $2 ${PARAM_VAL[$1]}"; }
-  local wgcmd="wg set $DEV"
+  wadd() {
+    [[ -v PARAM_VAL[$1] ]] || return 0
+    if [[ ${3:-} ]]; then
+      wgcmd+=" $2 <(printf %s \"\$$3\")"
+    else
+      wgcmd+=" $2 ${PARAM_VAL[$1]@Q}"
+    fi
+  }
+  local wgcmd="wg set ${DEV@Q}"
   wadd Interface:ListenPort     listen-port
   wadd Interface:FwMark         fwmark
+  wadd Interface:PrivateKey     private-key PrivateKey
   wadd Peer:PublicKey           peer
-  wadd Peer:AllowedIPs          allowed-ips
+  wadd Peer:PresharedKey        preshared-key PresharedKey
   wadd Peer:Endpoint            endpoint
   wadd Peer:PersistentKeepalive persistent-keepalive
+  wadd Peer:AllowedIPs          allowed-ips
   local PrivateKey=${PARAM_VAL[Interface:PrivateKey]} PresharedKey=${PARAM_VAL[Peer:PresharedKey]:-}
-  wgcmd+=' private-key <(printf %s "$PrivateKey")'${PresharedKey:+' preshared-key <(printf %s "$PresharedKey")'}
   eval "$wgcmd" || error "Failed to configure WireGuard interface '$DEV' using command:%%$wgcmd" fatal
+  error "TESTING" fatal
 
   # Protect endpoint reachability against:
   # - override routes 0/1 and 128/1 possibly added in configure_vpn_plain()
@@ -509,9 +519,9 @@ start_vpn() {
 is_connected() {
   HAS_NAMESPACE= IN_NAMESPACE=
   has_namespace && HAS_NAMESPACE=$NAMESPACE
-  ip -br link show $DEV : && return 0
+  ip -br link show $DEV : &>/dev/null && return 0
   [[ $HAS_NAMESPACE ]] || return 1
-  ip netns exec $NAMESPACE ip -br link show $DEV : || return 1
+  ip netns exec $NAMESPACE ip -br link show $DEV : &>/dev/null || return 1
   IN_NAMESPACE=$NAMESPACE
   return 0
 }
@@ -598,9 +608,9 @@ del_endpoint_host_route() {
   local nscmd=
   [[ $IN_NAMESPACE ]] && nscmd="ip netns exec $NAMESPACE"
   local -a ep=()
-  ep=($($nscmd wg show $DEV endpoints)) && [[ ${ep[1]:-} ]] && {
+  ep=($($nscmd wg show $DEV endpoints 2>/dev/null)) && [[ ${ep[1]:-} ]] && {
     ep=${ep[1]%%:*}
-    ip route del $ep || true
+    ip route del $ep : || true
   } || true
 }
 
@@ -894,7 +904,7 @@ clean_vpn() {
 
   # DNS restore: remove configuration associated with $DEV
   # If openresolv is missing or fails, proceed anyway
-  resolvconf -d $DEV >/dev/null || warn "Failed: resolvconf -d $DEV"
+  resolvconf -d $DEV &>/dev/null || true
   rm -rf /etc/netns/$NAMESPACE &>/dev/null || true
 
   if is_connected; then # Set HAS_NAMESPACE IN_NAMESPACE
@@ -1858,7 +1868,8 @@ validate_vpn_name() {
 
 assert_no_namespace() {
   local ns
-  ns=$(ip netns identify :) && [[ $ns ]] && error "Usage of wgc is not supported inside a network namespace ($ns)" fatal blameparent
+  ns=$(ip netns identify :)
+  [[ -z $ns ]] || error "Usage of wgc is not supported inside a network namespace ($ns)" fatal blameparent
 }
 
 # -----------------------------------------------------------------------------
@@ -1889,7 +1900,8 @@ pop_cleanup() {
 # - Flexible error reporting (soft vs fatal)
 # - fatal: Triggers cleanup stack unwinding and exits
 # - Graceful cleanup even when cleanup functions fail
-# - Multi-line message support (using %% or actual newlines)
+# - Multi-line message (using %% or actual newlines)
+# - On trap ERR special comment tags (#!|#>|#:) as error messages
 error() {
   local exit_code=$?  msg=$1; shift
   local p_fatal= p_blameparent=
@@ -1904,17 +1916,70 @@ error() {
   [[ $p_blameparent ]] && line=${BASH_LINENO[1]}
 
   case "$msg" in
-    "")
-      ;;
     TRAP-ERR)
-      echo "${X}ERROR @$line: Command '$BASH_COMMAND' failed with exit code $exit_code" >&2
-      show_traceback >&2
+      local custom_msg= final_msg= tag= technical_msg="Command '$BASH_COMMAND' failed with exit code $exit_code"
+
+      local -a chunk
+      mapfile -t -n 4 -s "$((line-1))" chunk < "${BASH_SOURCE[1]}" # Read line of failure and next 3 lines
+
+      local regex1="^.*[[:space:]](#!|#>|#:)[[:space:]]*(.*)$" # Same line
+      local regex2="^[[:space:]]*(#!|#>|#:)[[:space:]]*(.*)$"  # Next line
+      local continuation_idx=0
+
+      if [[ ${chunk[0]} =~ $regex1 ]]; then
+         continuation_idx=1
+      elif [[ ${chunk[1]} =~ $regex2 ]]; then
+         continuation_idx=2
+      fi
+
+      if (( continuation_idx > 0 )); then
+         tag=${BASH_REMATCH[1]}
+         custom_msg=${BASH_REMATCH[2]}
+         local i line
+         for ((i=continuation_idx; i<${#chunk[@]}; i++)); do
+           line=${chunk[$i]}
+           [[ $line == *([[:space:]])"$tag"* ]] || break
+           custom_msg+=" ${line#*([[:space:]])"$tag"*([[:space:]])}"
+         done
+      fi
+
+      if [[ $custom_msg ]]; then
+         custom_msg=${custom_msg//\\/\\\\}
+         eval "custom_msg=\"${custom_msg//\"/\\\"}\""
+      fi
+
+      case "$tag" in
+        '#!') # Prepend + Fatal
+          final_msg=$custom_msg%%$technical_msg
+          p_fatal=1
+          ;;
+        '#>') # Replace + Fatal
+          final_msg=$custom_msg
+          p_fatal=1
+          ;;
+        '#:') # Replace + Non-Fatal
+          final_msg=$custom_msg
+          p_fatal=
+          ;;
+        *)    # Default (no tag found)
+          final_msg=$technical_msg
+          p_fatal=1
+          ;;
+      esac
+
+      indent_multiline final_msg
+      echo "${X}ERROR @$line: $final_msg" >&2
+      [[ $tag ]] || show_traceback >&2
       ;;
     TRAP-INT)
-     echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&2
+      echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&2
+      p_fatal=1
       ;;
     TRAP-TERM)
       echo "${W} Terminated by signal (SIGTERM) @$line while executing '$BASH_COMMAND'" >&2
+      p_fatal=1
+      ;;
+    "")
       ;;
     *)
       indent_multiline msg
