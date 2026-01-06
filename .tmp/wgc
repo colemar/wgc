@@ -64,15 +64,15 @@ doit() {
   local IFS=$' \t\n'
 
   local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
-  local CLEANUP_STACK=() LOCKS=()
+
+  # When a crash (e.g. unbounded var) triggers EXIT trap, the inherited local scopes are destroyed
+  declare -g CLEANUP_STACK=() LOCKS=() TRACE_FILE= TRACE_FD=
+  declare -gi __tr_last=0 __tr_now=0 __tr_delta=0
+  [[ ${1:-} == trace ]] && { shift 1; trace_on; }
   trap 'at_exit' EXIT
   trap 'error TRAP-ERR' ERR
   trap 'error TRAP-INT' INT
   trap 'error TRAP-TERM' TERM
-
-  local TRACE_FILE= TRACE_FD=
-  local -i __tr_last=0 __tr_now=0 __tr_delta=0
-  [[ ${1:-} == trace ]] && { shift 1; trace_on; }
 
   readonly CMD=${1:-} VPN=${2:-}
   readonly DEV=wgc_${VPN:-}
@@ -247,8 +247,24 @@ trace_off() {
 }
 
 at_exit() {
+  local exit_code=$?
+  cleanup_stack_unwind
   release_all_locks
   trace_off
+  exit $exit_code
+}
+
+cleanup_stack_unwind() {
+  local k=
+  for (( k=${#CLEANUP_STACK[@]}-1; k>=0; k-- )); do
+    local clean_func=${CLEANUP_STACK[$k]}
+    if declare -F "$clean_func" >/dev/null; then
+      echo "  [$k] Calling: $clean_func" >&2
+      $clean_func || echo "      (Warning: '$clean_func' failed, continuing...)" >&2
+    else
+      echo "  [$k] Error: Function '$clean_func' not defined" >&2
+    fi
+  done
 }
 
 acquire_lock() {
@@ -1988,17 +2004,6 @@ error() {
   esac
 
   if [[ $p_fatal ]]; then
-    # unwind of CLEANUP_STACK
-    local k=
-    for (( k=${#CLEANUP_STACK[@]}-1; k>=0; k-- )); do
-      local clean_func=${CLEANUP_STACK[$k]}
-      if declare -F "$clean_func" >/dev/null; then
-        echo "  [$k] Calling: $clean_func" >&2
-        $clean_func || echo "      (Warning: '$clean_func' failed, continuing...)" >&2
-      else
-        echo "  [$k] Error: Function '$clean_func' not defined" >&2
-      fi
-    done
     echo "Aborted." >&2
     exit 1
   fi
