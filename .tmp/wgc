@@ -21,6 +21,7 @@
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
 shopt -s extglob
+shopt -s extdebug
 
 doit() {
   if [ -z "$BASH_VERSION" ]; then
@@ -36,16 +37,13 @@ doit() {
   local safesudo
   safesudo=$(command -p -v sudo) || { echo "ERROR: sudo not found in standard paths." >&2; exit 1; }
   if [[ ! $UID == 0 ]]; then
-    exec $safesudo WGC_CFGDIR="$WGC_CFGDIR" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
+    exec $safesudo WGC_CFGDIR="$WGC_CFGDIR" WGC_AUTH="$WGC_AUTH" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
   fi
   # unset fails when readonly, so use exec env -i
   [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
     exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
 
   export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-  set +vx
-  [[ ${1:-} == trace ]] && { set -vx; shift; }
 
   # Shell state baseline
   set +abefhkmnptuBCEHPT
@@ -57,26 +55,29 @@ doit() {
   set -o nounset     # Treat unset variables as an error.
   set -o pipefail    # Return value of a pipeline is the status of the last command to exit with a non-zero status.
   set -o noglob      # Disable globbing (enable it later temporarily if needed)
-  set -o errexit   # Exit immediately if a command exits with a non-zero status.
-  set -o errtrace  # Trap ERR is inherited by functions.
-  trap 'error TRAP-ERR' ERR
-  trap 'error TRAP-INT' INT
-  trap 'error TRAP-TERM' TERM
+  set +o errexit     # Don't exit immediately if a command exits with a non-zero status. Rely to trap ERR instead.
+  set -o errtrace    # Trap ERR is inherited by functions, command substitutions and subshells.
   shopt -s extglob   # Enable extended glob patterns: x(y)
   shopt -s nullglob  # Patterns which match no files expand to a null string
   shopt -s checkwinsize extquote
   export LC_ALL=C LANG=C
   local IFS=$' \t\n'
 
-  #(( $# == 0 )) && { show_usage; exit; }
+  local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
+  local CLEANUP_STACK=() LOCKS=()
+  trap 'at_exit' EXIT
+  trap 'error TRAP-ERR' ERR
+  trap 'error TRAP-INT' INT
+  trap 'error TRAP-TERM' TERM
+
+  local TRACE_FILE= TRACE_FD=
+  local -i __tr_last=0 __tr_now=0 __tr_delta=0
+  [[ ${1:-} == trace ]] && { shift 1; trace_on; }
 
   readonly CMD=${1:-} VPN=${2:-}
   readonly DEV=wgc_${VPN:-}
   readonly NAMESPACE=$DEV
 
-  local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
-  local CFGDIR; set_cfgdir; readonly CFGDIR
-  local IPCMD; set_ipcmd; readonly IPCMD
   local HAS_NAMESPACE IN_NAMESPACE
   local -A PARAM_VAL PARAM_LNO
   local -a PARAM_DEFS=( # mrs: Multivalued Required Secret
@@ -92,8 +93,8 @@ doit() {
     PARAMS+=( $section:$key ); PARAM_ATTR[$section:$key]=$attr; SECTIONS[$section]=1
   done
   readonly PARAMS PARAM_ATTR SECTIONS
-  local -a CLEANUP_STACK=()
-  local -A LOCKS=(); trap 'release_all_locks' EXIT
+
+  local CFGDIR; set_cfgdir; readonly CFGDIR
 
   case "$CMD" in
     up|fup|bup?(d)|nup)
@@ -136,17 +137,19 @@ doit() {
       :
       ;;
     f)
+      assert_auth
       "${@:2}"
-      ;;
-    ft)
-      PS4='+${LINENO}:${FUNCNAME[0]}: '
-      shopt -s promptvars
-      set -vx; "${@:2}"
       ;;
     *)
       show_usage
       ;;
   esac
+
+  exit 0
+}
+
+assert_auth() {
+  [[ $(sha512sum <<< "${WGC_AUTH:-}") == 3bb5692159057f407e9dca8f255e8eef* ]] || error "WGC_AUTH is wrong." fatal
 }
 
 show_usage() {
@@ -219,11 +222,40 @@ EOF
 printf "\n%s\n\n" "$usage"
 }
 
+trace_on() {
+  TRACE_FILE=$(mktemp /dev/shm/wgc_trace_XX"XX"XX)
+  PS4='#+$((__tr_now=${EPOCHREALTIME/./}, __tr_delta=__tr_now-__tr_last, __tr_last=__tr_now, __tr_delta))'
+  PS4+=':${LINENO}:${FUNCNAME[0]}\n\011$BASH_COMMAND\n\011'
+  shopt -s promptvars
+  exec {TRACE_FD}>$TRACE_FILE
+  BASH_XTRACEFD=$TRACE_FD
+  __tr_last=${EPOCHREALTIME/./}
+  echo -e '#!/bin/bash\n# vim: ft=sh wrap breakindent' >&${TRACE_FD}
+  set -x
+}
+
+trace_off() {
+  [[ $TRACE_FD ]] || return 0
+  set +x
+  exec {TRACE_FD}>&-
+  unset BASH_XTRACEFD
+  local dump=/tmp/${TRACE_FILE##*/}
+  cp $TRACE_FILE $dump && rm -f $TRACE_FILE
+  [[ ${SUDO_UID:-} ]] && chown ${SUDO_UID}:${SUDO_GID:-$SUDO_UID} $dump
+  TRACE_FD= TRACE_FILE=
+  echo "TRACE: view $dump"
+}
+
+at_exit() {
+  release_all_locks
+  trace_off
+}
+
 acquire_lock() {
   local id=$1 msg=$2
   local lock_file="/var/run/wgc.${id}.lock" fd
 
-  exec {fd}>"$lock_file" || error "Cannot create lock file: $lock_file" fatal blameparent
+  exec {fd}>"$lock_file" #> Cannot create lock file: $lock_file
   if ! flock -n $fd; then
     exec {fd}>&-
     error "Another wgc instance is $msg. Try again in a moment." fatal blameparent
@@ -390,64 +422,21 @@ prc() {
 set_cfgdir() {
   CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
   # Validate directory
-  [[ $CFGDIR == /* ]] || error "WGC_CFGDIR must be an absolute path: $CFGDIR" fatal
-  [[ -L "$CFGDIR" ]] && error "Symlink not allowed '$CFGDIR'. Check WGC_CFGDIR." fatal
-  [[ -d "$CFGDIR" ]] || error "Directory '$CFGDIR' not found. Check WGC_CFGDIR." fatal
+  [[ $CFGDIR == /* ]] #> WGC_CFGDIR must be an absolute path: $CFGDIR
+  [[ ! -L "$CFGDIR" ]] #> Symlink not allowed '$CFGDIR'. Check WGC_CFGDIR.
+  [[ -d "$CFGDIR" ]] #> Directory '$CFGDIR' not found. Check WGC_CFGDIR.
   local status=$(stat -c '%U%A' "$CFGDIR" 2>/dev/null)
-  [[ $status ]] || error "Could not read status of directory '$CFGDIR'. Access to metadata denied or restricted." fatal
-  [[ $status == rootd* ]] || error "Security: $CFGDIR must be a root-owned directory." fatal
-  [[ ${status:9:1} == w || ${status:12:1} == w ]] && \
-    error "Security: '$CFGDIR' is writable by non-root users (perms: ${status:4}). Revoke 'w' bits." fatal
-  ls "$CFGDIR" &>/dev/null || \
-    error "Cannot access configuration directory: $CFGDIR
-           Possible causes: SELinux, AppArmor, or mount restrictions.
-           Debug: sudo ls -ldZ '$CFGDIR' && sudo getenforce" fatal
-  [[ -f "$CFGDIR/wgc_enable" ]] || error "Security: Approval file 'wgc_enable' missing in $CFGDIR. Root must create it." fatal
-  [[ ${status:11:1} == r ]] || \
-    warn "Add 'r' bit for others to '$CFGDIR' (chmod o+r, current perms: ${status:4}) to enable command completion without sudo prompt."
-}
-
-set_ipcmd() {
-  IPCMD=$(type -P ip) || error "Could not find command 'ip'. Install with: sudo apt install iproute2" fatal blameparent
-}
-
-ip() {
-  (( $# > 0 )) || error "ip function: no arguments provided" fatal blameparent
-
-  local -a cmd_args=("$@")
-  local err_msg= silent_fail= last_arg=${!#}
-
-  # If last argument begins with ":" then it is a custom error message: extract it.
-  if [[ $last_arg == :* ]]; then
-    err_msg=${last_arg#:}
-    [[ $err_msg ]] || silent_fail=1
-    unset cmd_args[-1] # remove last argument
-  fi
-
-  # At least one argument is needed for ip command
-  (( ${#cmd_args[@]} > 0 )) || error "ip function: no command provided" fatal blameparent
-
-  # Execute ip command and capture both stdout and stderr for comprehensive error reporting.
-  # If ip command succeeds, print out its output.
-  # When ip command fails:
-  # - if a custom error ":message" is provided as last arg, report and terminate.
-  # - if no custom error message is provided, report and return ip command exit code.
-  # - if last arg is ":", suppress all output and return ip command exit code.
-  local full_cmd output
-  printf -v full_cmd '%q ' "$IPCMD" "${cmd_args[@]}"
-  output=$($IPCMD "${cmd_args[@]}" 2>&1); local exit_code=$?
-  if (( exit_code != 0 )); then
-    if [[ $err_msg ]]; then
-      error "$err_msg%%Command: $full_cmd%%Exit code: $exit_code%%→ $output" fatal blameparent
-    else
-      [[ $silent_fail ]] && return $exit_code
-      error "Command failed: $full_cmd%%Exit code: $exit_code%%→ $output" blameparent
-      return $exit_code
-    fi
-  fi
-  # Print ip command output. Needed for command substitution: $(ip ...)
-  [[ $output ]] && printf '%s\n' "$output"
-
+  [[ $status ]] #> Could not read status of directory '$CFGDIR'. Access to metadata denied or restricted.
+  [[ $status == rootd* ]] #> Security: $CFGDIR must be a root-owned directory.
+  [[ ${status:9:1} != w && ${status:12:1} != w ]]
+    #> Security: '$CFGDIR' is writable by non-root users (perms: ${status:4}). Revoke 'w' bits.
+  ls "$CFGDIR" &>/dev/null
+    #> Cannot access configuration directory: $CFGDIR %%
+    #> Possible causes: SELinux, AppArmor, or mount restrictions. %%
+    #> Debug: sudo ls -ldZ '$CFGDIR' && sudo getenforce
+  [[ -f "$CFGDIR/wgc_enable" ]] #> Security: Approval file 'wgc_enable' missing in $CFGDIR. Root must create it.
+  [[ ${status:11:1} == r ]]
+    #w Add 'r' bit for others to '$CFGDIR' (chmod o+r, current perms: ${status:4}) to enable command completion without sudo prompt.
   return 0
 }
 
@@ -463,12 +452,12 @@ start_vpn() {
   # get parameters and forwarding bridges from config file named $VPN
   parse_config_file $VPN $(decode $CMD nup bridges)
 
-  [[ ${PARAM_VAL[MTU]:-} ]] && compute_mtu
+  [[ ${PARAM_VAL[Interface:MTU]:-} ]] || compute_mtu
 
   push_cleanup clean_vpn
 
   # Create WireGuard interface
-  ip link add dev $DEV type wireguard :"Failed to create WireGuard interface '$DEV'"
+  ip link add dev $DEV type wireguard #! Failed to create WireGuard interface '$DEV'
 
   # Override AllowedIPs for Full Tunnel (fup), Bind-Only (bup/bupd) and Namespace (nup) modes.
   # Instructs WireGuard to allow all traffic in and out of the tunnel.
@@ -496,8 +485,7 @@ start_vpn() {
   wadd Peer:PersistentKeepalive persistent-keepalive
   wadd Peer:AllowedIPs          allowed-ips
   local PrivateKey=${PARAM_VAL[Interface:PrivateKey]} PresharedKey=${PARAM_VAL[Peer:PresharedKey]:-}
-  eval "$wgcmd" || error "Failed to configure WireGuard interface '$DEV' using command:%%$wgcmd" fatal
-  error "TESTING" fatal
+  eval "$wgcmd" #> Failed to configure WireGuard interface '$DEV' using command:%%$wgcmd
 
   # Protect endpoint reachability against:
   # - override routes 0/1 and 128/1 possibly added in configure_vpn_plain()
@@ -519,9 +507,9 @@ start_vpn() {
 is_connected() {
   HAS_NAMESPACE= IN_NAMESPACE=
   has_namespace && HAS_NAMESPACE=$NAMESPACE
-  ip -br link show $DEV : &>/dev/null && return 0
+  ip -br link show $DEV &>/dev/null && return 0
   [[ $HAS_NAMESPACE ]] || return 1
-  ip netns exec $NAMESPACE ip -br link show $DEV : &>/dev/null || return 1
+  ip netns exec $NAMESPACE ip -br link show $DEV &>/dev/null || return 1
   IN_NAMESPACE=$NAMESPACE
   return 0
 }
@@ -532,16 +520,17 @@ has_namespace() {
 
 configure_vpn_plain() {
   # Configure interface $DEV
-  ip link set $DEV mtu ${PARAM_VAL[MTU]} :"Failed to configure MTU '${PARAM_VAL[MTU]}' for interface '$DEV'"
+  ip link set $DEV mtu ${PARAM_VAL[Interface:MTU]} #! Failed to configure MTU '${PARAM_VAL[Interface:MTU]}' for interface '$DEV'
 
   local addr IFS=,
   for addr in ${PARAM_VAL[Interface:Address]}; do
-    ip addr add "$addr" dev $DEV :"Failed to configure address '$addr' for interface '$DEV'"
+    ip addr add "$addr" dev $DEV #! Failed to add address '$addr' to interface '$DEV'
   done
-  ip link set $DEV up :"Failed to bring up interface '$DEV'"
+  ip link set $DEV up #! Failed to bring up interface '$DEV'
 
   # Always add default route valid only for VPN source addresses (source policy routing)
   set_source_routing
+  # XXX giunto qui
 
   if [[ $CMD == @(up|fup) ]]; then
     local set_override= IFS=,
@@ -596,59 +585,59 @@ set_override_default_route() {
 
 set_endpoint_host_route() {
   local ep=${PARAM_VAL[Peer:Endpoint]%%:*} route
-  local -a route_args
-  route=$(ip -j route get "$ep" :"Cannot find route to Endpoint $ep")
+  local route_args=() IFS=' '
+  route=$(ip -j route get "$ep") #! Cannot find route to Endpoint $ep
   [[ $route =~ \"gateway\":\"([^\"]+)\" ]] && route_args+=(via "${BASH_REMATCH[1]}")
-  [[ $route =~ \"dev\":\"([^\"]+)\" ]] || error "Cannot determine output device for Endpoint $ep" fatal
+  [[ $route =~ \"dev\":\"([^\"]+)\" ]] #> Cannot determine output device for Endpoint $ep
   route_args+=(dev "${BASH_REMATCH[1]}")
-  ip route add "$ep" "${route_args[@]}" :"Cannot set host route to Endpoint $ep"
+  ip route add "$ep" "${route_args[@]}" #! Cannot set host route to Endpoint $ep
 }
 
 del_endpoint_host_route() {
   local nscmd=
   [[ $IN_NAMESPACE ]] && nscmd="ip netns exec $NAMESPACE"
-  local -a ep=()
-  ep=($($nscmd wg show $DEV endpoints 2>/dev/null)) && [[ ${ep[1]:-} ]] && {
-    ep=${ep[1]%%:*}
-    ip route del $ep : || true
+  local ep=() IFS=$' \t\n'
+  ep=( $($nscmd wg show $DEV endpoints 2>/dev/null) ) && [[ ${ep[1]:-} ]] && {
+    ip route del ${ep[1]%%:*} &>/dev/null || true
   } || true
 }
 
 set_source_routing() {
   local -i t
   for ((t=51820; t<52000; t++)); do
-    [[ $(ip route show table $t :) ]] || break
+    [[ $(ip route show table $t 2>/dev/null || true) ]] || break
   done
   ((t > 51999)) && error "Could not find an empty routing table in the range 51820..51999" fatal
-  ip route add default dev $DEV table $t :"Could not add default route via $DEV in table $t"
+  ip route add default dev $DEV table $t #! Could not add default route via $DEV in table $t
   local addr IFS=,
   for addr in ${PARAM_VAL[Interface:Address]}; do
-    ip rule add from ${addr%/*} table $t :"Could not add source routing rule for ip address ${addr%/*}"
+    ip rule add from ${addr%/*} table $t #! Could not add source routing rule for ip address ${addr%/*}
   done
 }
 
 del_source_routing() {
   local t json regex
-  t=$(find_source_routing_table) || return 0
+  find_source_routing_table t || return 0
   json=$(ip -j -br addr show "$DEV") || return 0
   regex='"local":"(([0-9]{1,3}\.){3}[0-9]{1,3})"'
   while [[ $json =~ $regex ]]; do
-    ip rule del from "${BASH_REMATCH[1]}" table $t || true
+    ip rule del from "${BASH_REMATCH[1]}" table $t &>/dev/null || true
     json="${json#*"${BASH_REMATCH[0]}"}"
   done
 }
 
 find_source_routing_table() {
-  local t json regex='"dst":"default","table":"(51[89][0-9]{2})"'
-  json=$(ip -j route show dev "$DEV" table all) || return 1
-  [[ $json =~ $regex ]] && t=${BASH_REMATCH[1]} || return 1
-  (( 51820 <= t && t <= 51999 )) || return 1
-  printf %s $t
+  local -n _out=$1
+  local _t _json _regex='"dst":"default","table":"(51[89][0-9]{2})"'
+  _json=$(ip -j route show dev $DEV table all) || return 1
+  [[ $_json =~ $_regex ]] && _t=${BASH_REMATCH[1]} || return 1
+  (( 51820 <= _t && _t <= 51999 )) || return 1
+  _out=$_t
 }
 
 compute_mtu() {
-  local m ep=${PARAM_VAL[Peer:Endpoint]%%:*}
-  local r=$(ip route get "$ep" : || ip route show default : || true)
+  local m= ep=${PARAM_VAL[Peer:Endpoint]%%:*}
+  local r=$(ip route get "$ep" 2>/dev/null || ip route show default 2>/dev/null || true)
   [[ $r =~ mtu\ ([0-9]+) ]] && m=${BASH_REMATCH[1]}
   [[ ! $m && $r =~ dev\ ([^ ]+) ]] && m=$(<"/sys/class/net/${BASH_REMATCH[1]}/mtu") 2>&-
   PARAM_VAL[Interface:MTU]=$(( ${m:-1500} - 60 )) # -80 if IPv6
@@ -1450,6 +1439,7 @@ check_dependencies() {
     command -v $cmd >/dev/null || missing+=($cmd)
   done
   if (( ${#missing[@]} > 0 )); then
+    local IFS=,
     error "Missing required commands: ${missing[*]}
            Install with:
            apt install wireguard-tools iproute2 grep sed coreutils \\
@@ -1482,7 +1472,7 @@ exec_in_namespace() {
     read -r _ _ _ grandpa_pid _ < /proc/$PPID/stat # get sudo pid
     # Build the environment for the final command
     local -a FINAL_ENV
-    while IFS= read -r -d '' var_eq_val; do
+    while read -r -d '' var_eq_val; do
       var=${var_eq_val%%=*}
       [[ $var == @(PWD|_) ]] && continue
       FINAL_ENV+=("$var_eq_val")
@@ -1570,7 +1560,7 @@ enable_completion() {
 
   cat > "$completion_file" << 'EOF'
 _wgc_completion() {
-  local cur= prev= commands=
+  local cur= prev= commands= IFS=$' \t\n'
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
@@ -1862,14 +1852,13 @@ remove_openresolv() {
 }
 
 validate_vpn_name() {
-  [[ $VPN =~ ^[a-zA-Z0-9_-]{1,11}$ ]] || \
-    error "Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max length is 11." fatal blameparent
+  [[ $VPN =~ ^[a-zA-Z0-9_-]{1,11}$ ]]
+    #> Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max length is 11.
 }
 
 assert_no_namespace() {
-  local ns
-  ns=$(ip netns identify :)
-  [[ -z $ns ]] || error "Usage of wgc is not supported inside a network namespace ($ns)" fatal blameparent
+  local ns=$(ip netns identify)
+  [[ -z $ns ]] #> Usage of wgc is not supported inside a network namespace ($ns)
 }
 
 # -----------------------------------------------------------------------------
@@ -1904,7 +1893,7 @@ pop_cleanup() {
 # - On trap ERR special comment tags (#!|#>|#:) as error messages
 error() {
   local exit_code=$?  msg=$1; shift
-  local p_fatal= p_blameparent=
+  local p_fatal= p_blameparent= IFS=$' \t\n'
   eval "$(get_params "$@")"
 
   local original_traps=$(trap -p)
@@ -1917,13 +1906,14 @@ error() {
 
   case "$msg" in
     TRAP-ERR)
-      local custom_msg= final_msg= tag= technical_msg="Command '$BASH_COMMAND' failed with exit code $exit_code"
+      local custom_msg= final_msg= tag= warning=
+      local technical_msg="This command failed with exit code $exit_code: $BASH_COMMAND"
 
       local -a chunk
       mapfile -t -n 4 -s "$((line-1))" chunk < "${BASH_SOURCE[1]}" # Read line of failure and next 3 lines
 
-      local regex1="^.*[[:space:]](#!|#>|#:)[[:space:]]*(.*)$" # Same line
-      local regex2="^[[:space:]]*(#!|#>|#:)[[:space:]]*(.*)$"  # Next line
+      local regex1="^.*[[:space:]](#!|#>|#:|#w)[[:space:]]*(.*)$" # Same line
+      local regex2="^[[:space:]]*(#!|#>|#:|#w)[[:space:]]*(.*)$"  # Next line
       local continuation_idx=0
 
       if [[ ${chunk[0]} =~ $regex1 ]]; then
@@ -1935,17 +1925,18 @@ error() {
       if (( continuation_idx > 0 )); then
          tag=${BASH_REMATCH[1]}
          custom_msg=${BASH_REMATCH[2]}
-         local i line
+         local i l
          for ((i=continuation_idx; i<${#chunk[@]}; i++)); do
-           line=${chunk[$i]}
-           [[ $line == *([[:space:]])"$tag"* ]] || break
-           custom_msg+=" ${line#*([[:space:]])"$tag"*([[:space:]])}"
+           l=${chunk[$i]}
+           [[ $l == *([[:space:]])"$tag"* ]] || break
+           custom_msg+="${l#*([[:space:]])"$tag"*([[:space:]])}"
          done
       fi
 
       if [[ $custom_msg ]]; then
-         custom_msg=${custom_msg//\\/\\\\}
-         eval "custom_msg=\"${custom_msg//\"/\\\"}\""
+         custom_msg="$custom_msg " # a last / would break heredoc
+         printf -v custom_msg "read -r -d '' custom_msg <<Q29sZXR0aQ\n%s\nQ29sZXR0aQ" "$custom_msg"
+         eval "$custom_msg" || true
       fi
 
       case "$tag" in
@@ -1961,15 +1952,24 @@ error() {
           final_msg=$custom_msg
           p_fatal=
           ;;
+        '#w') # Replace + Non-Fatal + Warning
+          final_msg=$custom_msg
+          p_fatal=
+          warning=1
+          ;;
         *)    # Default (no tag found)
           final_msg=$technical_msg
           p_fatal=1
           ;;
       esac
 
-      indent_multiline final_msg
-      echo "${X}ERROR @$line: $final_msg" >&2
-      [[ $tag ]] || show_traceback >&2
+      if [[ $warning ]]; then
+        warn "$final_msg"
+      else
+        indent_multiline final_msg
+        echo "${X}ERROR @$line: $final_msg" >&2
+        [[ $tag ]] || show_traceback >&2
+      fi
       ;;
     TRAP-INT)
       echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&2
