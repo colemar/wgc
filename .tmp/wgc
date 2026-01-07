@@ -1923,7 +1923,7 @@ error() {
   case "$msg" in
     TRAP-ERR)
       local custom_msg= final_msg= tag= warning= exp_cmd=$(safer_expand "$BASH_COMMAND")
-      local technical_msg="This command failed with exit code $exit_code:%%$BASH_COMMAND%%$exp_cmd"
+      local technical_msg=$'\u2193'"This command failed with exit code $exit_code%%$BASH_COMMAND%%$exp_cmd"
 
       local -a chunk
       mapfile -t -n 4 -s "$((line-1))" chunk < "${BASH_SOURCE[1]}" # Read line of failure and next 3 lines
