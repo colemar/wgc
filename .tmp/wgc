@@ -20,8 +20,8 @@
 # Guard against sourcing.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
-shopt -s extglob
-shopt -s extdebug
+shopt -s extglob # Allow parsing of extended globbing
+[[ ${1:-} == trace ]] && shopt -s extdebug # Enable precise and absolute LINENO
 
 doit() {
   if [ -z "$BASH_VERSION" ]; then
@@ -66,7 +66,8 @@ doit() {
   local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
 
   # When a crash (e.g. unbounded var) triggers EXIT trap, the inherited local scopes are destroyed
-  declare -g CLEANUP_STACK=() LOCKS=() TRACE_FILE= TRACE_FD=
+  declare -g CLEANUP_STACK=() TRACE_FILE= TRACE_FD=
+  declare -gA LOCKS=()
   declare -gi __tr_last=0 __tr_now=0 __tr_delta=0
   [[ ${1:-} == trace ]] && { shift 1; trace_on; }
   trap 'at_exit' EXIT
@@ -224,7 +225,7 @@ printf "\n%s\n\n" "$usage"
 
 trace_on() {
   TRACE_FILE=$(mktemp /dev/shm/wgc_trace_XX"XX"XX)
-  PS4='#+$((__tr_now=${EPOCHREALTIME/./}, __tr_delta=__tr_now-__tr_last, __tr_last=__tr_now, __tr_delta))'
+  PS4='#+$((__tr_now=${EPOCHREALTIME/./},__tr_delta=__tr_now-__tr_last,__tr_last=__tr_now,__tr_delta))'
   PS4+=':${LINENO}:${FUNCNAME[0]}\n\011$BASH_COMMAND\n\011'
   shopt -s promptvars
   exec {TRACE_FD}>$TRACE_FILE
@@ -276,7 +277,6 @@ acquire_lock() {
     exec {fd}>&-
     error "Another wgc instance is $msg. Try again in a moment." fatal blameparent
   fi
-
   LOCKS[$id]=$fd
   return 0
 }
@@ -546,13 +546,12 @@ configure_vpn_plain() {
 
   # Always add default route valid only for VPN source addresses (source policy routing)
   set_source_routing
-  # XXX giunto qui
 
   if [[ $CMD == @(up|fup) ]]; then
     local set_override= IFS=,
     for k in ${PARAM_VAL[Peer:AllowedIPs]}; do
       [[ $k == "0.0.0.0/0" ]] && { set_override=1; continue; }
-      ip route add "$k" dev $DEV :"Cannot add route to $k"
+      ip route add "$k" dev $DEV #! Cannot add route to $k
     done
     [[ $set_override ]] && set_override_default_route
   fi
@@ -562,7 +561,7 @@ configure_vpn_plain() {
     local k= q= IFS=,
     for k in ${PARAM_VAL[Interface:DNS]}; do
       q+="nameserver $k"$'\n'
-      [[ $CMD == bupd ]] && { ip route add "$k" dev "$DEV" || warn "Cannot add route to nameserver $k"; }
+      [[ $CMD == bupd ]] && ip route add "$k" dev $DEV #W Cannot add route to nameserver $k
     done
     if resolvconf -a $DEV -m 0 -x <<< "$q"; then
       check_dns_reachability "${PARAM_VAL[Interface:DNS]}"
@@ -574,8 +573,9 @@ configure_vpn_plain() {
 }
 
 check_dns_reachability() {
+  local dns_list=$1 # strict csv
   local nsip route_info current_dev dns_warnings= IFS=,
-  for nsip in ${PARAM_VAL[Interface:DNS]};do
+  for nsip in $dns_list; do
     if route_info=$(ip route get "$nsip" 2>/dev/null); then
       if [[ $route_info != *"dev $DEV"* ]]; then
         if [[ $route_info =~ dev\ ([^[:space:]]+) ]]; then
@@ -589,14 +589,13 @@ check_dns_reachability() {
       dns_warnings+=$'\n'"- UNREACHABLE: No route found for $nsip."
     fi
   done
-  if [[ $dns_warnings ]]; then
-    warn "DNS routing issues detected:$dns_warnings"
-  fi
+  [[ ! $dns_warnings ]] #w DNS routing issues detected:$dns_warnings
+  return 0
 }
 
 set_override_default_route() {
-  ip route add 0/1 dev $DEV :"Cannot set default route override 0.0.0.0/1"
-  ip route add 128/1 dev $DEV :"Cannot set default route override 128.0.0.0/1"
+  ip route add 0/1 dev $DEV #! Cannot set default route override 0.0.0.0/1
+  ip route add 128/1 dev $DEV #! Cannot set default route override 128.0.0.0/1
 }
 
 set_endpoint_host_route() {
@@ -662,8 +661,9 @@ compute_mtu() {
 configure_vpn_in_namespace() {
 
   # Create and configure namespace
-  ip netns add $NAMESPACE :"Failed to create namespace '$NAMESPACE'"
-  ip link set $DEV netns $NAMESPACE :"Failed to move interface '$DEV' to namespace '$NAMESPACE'"
+  ip netns add $NAMESPACE #! Failed to create namespace '$NAMESPACE'
+  ip link set a$DEV netns $NAMESPACE #! Failed to move interface '$DEV' to namespace '$NAMESPACE'
+  error XXX fatal
   ip netns exec $NAMESPACE ip link set lo up :"Failed to bring up loopback interface in namespace '$NAMESPACE'"
   # Configure interface $DEV
   ip netns exec $NAMESPACE ip link set $DEV mtu ${PARAM_VAL[MTU]} :"Failed to configure MTU '${PARAM_VAL[MTU]} for interface '$DEV'"
@@ -1909,7 +1909,7 @@ pop_cleanup() {
 # - On trap ERR special comment tags (#!|#>|#:) as error messages
 error() {
   local exit_code=$?  msg=$1; shift
-  local p_fatal= p_blameparent= IFS=$' \t\n'
+  local exit_target=1; p_fatal= p_blameparent= IFS=$' \t\n'
   eval "$(get_params "$@")"
 
   local original_traps=$(trap -p)
@@ -1922,14 +1922,14 @@ error() {
 
   case "$msg" in
     TRAP-ERR)
-      local custom_msg= final_msg= tag= warning=
-      local technical_msg="This command failed with exit code $exit_code: $BASH_COMMAND"
+      local custom_msg= final_msg= tag= warning= exp_cmd=$(safer_expand "$BASH_COMMAND")
+      local technical_msg="This command failed with exit code $exit_code:%%$BASH_COMMAND%%$exp_cmd"
 
       local -a chunk
       mapfile -t -n 4 -s "$((line-1))" chunk < "${BASH_SOURCE[1]}" # Read line of failure and next 3 lines
 
-      local regex1="^.*[[:space:]](#!|#>|#:|#w)[[:space:]]*(.*)$" # Same line
-      local regex2="^[[:space:]]*(#!|#>|#:|#w)[[:space:]]*(.*)$"  # Next line
+      local regex1='^.*[[:space:]](#!|#\?|#W|#>|#:|#w)[[:space:]]*(.*)$' # Same line
+      local  regex2='^[[:space:]]*(#!|#\?|#W|#>|#:|#w)[[:space:]]*(.*)$' # Next line
       local continuation_idx=0
 
       if [[ ${chunk[0]} =~ $regex1 ]]; then
@@ -1950,15 +1950,25 @@ error() {
       fi
 
       if [[ $custom_msg ]]; then
-         custom_msg="$custom_msg " # a last / would break heredoc
-         printf -v custom_msg "read -r -d '' custom_msg <<Q29sZXR0aQ\n%s\nQ29sZXR0aQ" "$custom_msg"
-         eval "$custom_msg" || true
+        #custom_msg="$custom_msg " # a last \ would break heredoc
+        #printf -v custom_msg "read -r -d '' custom_msg <<Q29sZXR0aQ\n%s\nQ29sZXR0aQ" "$custom_msg"
+        #eval "$custom_msg" || true
+        custom_msg=$(safe_expand "$custom_msg")
       fi
 
       case "$tag" in
         '#!') # Prepend + Fatal
           final_msg=$custom_msg%%$technical_msg
           p_fatal=1
+          ;;
+        '#?') # Prepend + Non-Fatal
+          final_msg=$custom_msg%%$technical_msg
+          p_fatal=
+          ;;
+        '#W') # Prepend + Warning
+          final_msg=$custom_msg%%$technical_msg
+          p_fatal=
+          warning=1
           ;;
         '#>') # Replace + Fatal
           final_msg=$custom_msg
@@ -1968,7 +1978,7 @@ error() {
           final_msg=$custom_msg
           p_fatal=
           ;;
-        '#w') # Replace + Non-Fatal + Warning
+        '#w') # Replace + Warning
           final_msg=$custom_msg
           p_fatal=
           warning=1
@@ -1990,10 +2000,12 @@ error() {
     TRAP-INT)
       echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&2
       p_fatal=1
+      exit_target=130
       ;;
     TRAP-TERM)
       echo "${W} Terminated by signal (SIGTERM) @$line while executing '$BASH_COMMAND'" >&2
       p_fatal=1
+      exit_target=143
       ;;
     "")
       ;;
@@ -2005,11 +2017,30 @@ error() {
 
   if [[ $p_fatal ]]; then
     echo "Aborted." >&2
-    exit 1
+    exit $exit_target
   fi
 
   [[ $original_traps ]] && eval "$original_traps"
   return 0 # allow to use error() as soft error handler without adding ||true to avoid trap ERR and recursion
+}
+
+# Expand $var, $(command) and `command`. Safe for ";'" and so on.
+# Usage: expanded_cmd=$(safe_expand "$raw_cmd")
+safe_expand() {
+  local raw=$1 expanded IFS=$' \t\n'
+  printf -v raw "read -r -d '' expanded <<Q29sZXR0aQ ||true\n%s\nQ29sZXR0aQ" "$raw "
+  eval "$raw"
+  printf %s "$expanded"
+}
+
+# Expand only $var, not $(command) nor `command`. Safe for ";'" and so on.
+# Usage: expanded_cmd=$(safer_expand "$raw_cmd")
+safer_expand() {
+  local raw=$1 expanded IFS=$' \t\n'
+  raw=${raw//\`/\\\`}; raw=${raw//\$\(/\\\$\(}
+  printf -v raw "read -r -d '' expanded <<Q29sZXR0aQ ||true\n%s\nQ29sZXR0aQ" "$raw "
+  eval "$raw"
+  printf %s "$expanded"
 }
 
 show_traceback() {
