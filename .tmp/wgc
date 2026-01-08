@@ -149,8 +149,12 @@ doit() {
   exit 0
 }
 
+has_auth() {
+  [[ $(sha512sum <<< "${WGC_AUTH:-}") == 3bb5692159057f407e9dca8f255e8eef* ]]
+}
+
 assert_auth() {
-  [[ $(sha512sum <<< "${WGC_AUTH:-}") == 3bb5692159057f407e9dca8f255e8eef* ]] || error "WGC_AUTH is wrong." fatal
+  has_auth || error "WGC_AUTH is wrong." fatal
 }
 
 show_usage() {
@@ -248,10 +252,11 @@ trace_off() {
 }
 
 at_exit() {
-  local exit_code=$?
+  local exit_code=$? last_cmd=$BASH_COMMAND
   cleanup_stack_unwind
   release_all_locks
   trace_off
+  (( exit_code > 0 )) && [[ ! ${ERROR_HANDLED:-} ]] && error CRASH exit_code="$exit_code" command="$last_cmd"
   exit $exit_code
 }
 
@@ -286,7 +291,7 @@ release_all_locks() {
   for id in "${!LOCKS[@]}"; do
     fd=${LOCKS[$id]}
     flock -u $fd 2>/dev/null || true
-    exec {fd}>&- 2>/dev/null || true
+    exec {fd}>&- || true
   done
   LOCKS=()
 }
@@ -662,11 +667,11 @@ configure_vpn_in_namespace() {
 
   # Create and configure namespace
   ip netns add $NAMESPACE #! Failed to create namespace '$NAMESPACE'
-  ip link set a$DEV netns $NAMESPACE #! Failed to move interface '$DEV' to namespace '$NAMESPACE'
-  error XXX fatal
-  ip netns exec $NAMESPACE ip link set lo up :"Failed to bring up loopback interface in namespace '$NAMESPACE'"
+  ip link set $DEV netns $NAMESPACE #! Failed to move interface '$DEV' to namespace '$NAMESPACE'
+  ip netns exec $NAMESPACE ip link set lo up #! Failed to bring up loopback interface in namespace '$NAMESPACE'
   # Configure interface $DEV
-  ip netns exec $NAMESPACE ip link set $DEV mtu ${PARAM_VAL[MTU]} :"Failed to configure MTU '${PARAM_VAL[MTU]} for interface '$DEV'"
+  ip netns exec $NAMESPACE ip link set $DEV mtu ${PARAM_VAL[MTU]} #! Failed to configure MTU '${PARAM_VAL[MTU]} for interface '$DEV'
+  error XXX fatal
   local addr IFS=,
   for addr in ${PARAM_VAL[Interface:Address]}; do
     ip netns exec $NAMESPACE ip addr add "$addr" dev $DEV :"Failed to configure address '$addr' for interface '$DEV'"
@@ -1906,27 +1911,36 @@ pop_cleanup() {
 # - fatal: Triggers cleanup stack unwinding and exits
 # - Graceful cleanup even when cleanup functions fail
 # - Multi-line message (using %% or actual newlines)
-# - On trap ERR special comment tags (#!|#>|#:) as error messages
+# - On trap ERR: special comment tags (#!|#\?|#W|#>|#:|#w) as error messages
+# - Context passed as named args (command, exit_code) when arg1 is CRASH
 error() {
-  local exit_code=$?  msg=$1; shift
-  local exit_target=1; p_fatal= p_blameparent= IFS=$' \t\n'
+  local p_exit_code=$? msg=$1; shift
+  local p_fatal= p_blameparent=
+  local p_command=$BASH_COMMAND p_line=${BASH_LINENO[0]} p_source=${BASH_SOURCE[1]}
   eval "$(get_params "$@")"
+  line=$p_line; [[ $p_blameparent ]] && line=${BASH_LINENO[1]}
 
-  local original_traps=$(trap -p)
-  local - # Modifications of shell flags are local
-  trap - ERR INT TERM; set +e
+  local exit_target=$((p_exit_code>0 ? p_exit_code : 1))
+  local original_traps=$(trap -p) IFS=$' \t\n'
+  trap - ERR INT TERM
 
-  local line=${BASH_LINENO[0]}
+  declare -g ERROR_HANDLED=1
 
-  [[ $p_blameparent ]] && line=${BASH_LINENO[1]}
+  local technical_msg= exp_cmd=$(safer_expand "$p_command")
 
   case "$msg" in
+    CRASH)
+      technical_msg=$'  \u2193'" The script CRASHED with this command and exit code $p_exit_code%%$p_command%%$exp_cmd"
+      indent_multiline technical_msg
+      echo "$technical_msg" >&2
+      exit $exit_target
+      ;;
     TRAP-ERR)
-      local custom_msg= final_msg= tag= warning= exp_cmd=$(safer_expand "$BASH_COMMAND")
-      local technical_msg=$'\u2193'"This command failed with exit code $exit_code%%$BASH_COMMAND%%$exp_cmd"
+      local custom_msg= final_msg= tag= warning=
+      technical_msg=$'\u2193'" This command failed with exit code $p_exit_code%%$p_command%%$exp_cmd"
 
       local -a chunk
-      mapfile -t -n 4 -s "$((line-1))" chunk < "${BASH_SOURCE[1]}" # Read line of failure and next 3 lines
+      mapfile -t -n 4 -s "$((line-1))" chunk < "$p_source" # Read line of failure and next 3 lines
 
       local regex1='^.*[[:space:]](#!|#\?|#W|#>|#:|#w)[[:space:]]*(.*)$' # Same line
       local  regex2='^[[:space:]]*(#!|#\?|#W|#>|#:|#w)[[:space:]]*(.*)$' # Next line
@@ -1950,9 +1964,6 @@ error() {
       fi
 
       if [[ $custom_msg ]]; then
-        #custom_msg="$custom_msg " # a last \ would break heredoc
-        #printf -v custom_msg "read -r -d '' custom_msg <<Q29sZXR0aQ\n%s\nQ29sZXR0aQ" "$custom_msg"
-        #eval "$custom_msg" || true
         custom_msg=$(safe_expand "$custom_msg")
       fi
 
@@ -1993,17 +2004,17 @@ error() {
         warn "$final_msg"
       else
         indent_multiline final_msg
-        echo "${X}ERROR @$line: $final_msg" >&2
+        echo "${X:-}ERROR @$line: $final_msg" >&2
         [[ $tag ]] || show_traceback >&2
       fi
       ;;
     TRAP-INT)
-      echo "${W} Interrupted by user (SIGINT) @$line while executing '$BASH_COMMAND'" >&2
+      echo "${W} Interrupted by user (SIGINT) @$line while executing '$p_command'" >&2
       p_fatal=1
       exit_target=130
       ;;
     TRAP-TERM)
-      echo "${W} Terminated by signal (SIGTERM) @$line while executing '$BASH_COMMAND'" >&2
+      echo "${W} Terminated by signal (SIGTERM) @$line while executing '$p_command'" >&2
       p_fatal=1
       exit_target=143
       ;;
@@ -2028,18 +2039,19 @@ error() {
 # Usage: expanded_cmd=$(safe_expand "$raw_cmd")
 safe_expand() {
   local raw=$1 expanded IFS=$' \t\n'
-  printf -v raw "read -r -d '' expanded <<Q29sZXR0aQ ||true\n%s\nQ29sZXR0aQ" "$raw "
-  eval "$raw"
+  local -; set +o nounset
+  eval $'read -r -d "" expanded <<Q29sZXR0aQ ||true\n'"$raw "$'\nQ29sZXR0aQ'
   printf %s "$expanded"
 }
 
 # Expand only $var, not $(command) nor `command`. Safe for ";'" and so on.
 # Usage: expanded_cmd=$(safer_expand "$raw_cmd")
 safer_expand() {
+  has_auth || return 0
   local raw=$1 expanded IFS=$' \t\n'
   raw=${raw//\`/\\\`}; raw=${raw//\$\(/\\\$\(}
-  printf -v raw "read -r -d '' expanded <<Q29sZXR0aQ ||true\n%s\nQ29sZXR0aQ" "$raw "
-  eval "$raw"
+  local -; set +o nounset
+  eval $'read -r -d "" expanded <<Q29sZXR0aQ ||true\n'"$raw "$'\nQ29sZXR0aQ'
   printf %s "$expanded"
 }
 
