@@ -228,6 +228,7 @@ printf "\n%s\n\n" "$usage"
 }
 
 trace_on() {
+  local IFS=$' \t\n' # This function could be called in a context where IFS is unexpected
   TRACE_FILE=$(mktemp /dev/shm/wgc_trace_XX"XX"XX)
   PS4='#+$((__tr_now=${EPOCHREALTIME/./},__tr_delta=__tr_now-__tr_last,__tr_last=__tr_now,__tr_delta))'
   PS4+=':${LINENO}:${FUNCNAME[0]}\n\011$BASH_COMMAND\n\011'
@@ -240,8 +241,9 @@ trace_on() {
 }
 
 trace_off() {
-  [[ $TRACE_FD ]] || return 0
   set +x
+  local IFS=$' \t\n' # This function could be called in a context where IFS is unexpected
+  [[ $TRACE_FD ]] || return 0
   exec {TRACE_FD}>&-
   unset BASH_XTRACEFD
   local dump=/tmp/${TRACE_FILE##*/}
@@ -252,7 +254,7 @@ trace_off() {
 }
 
 at_exit() {
-  local exit_code=$? last_cmd=$BASH_COMMAND
+  local exit_code=$? last_cmd=$BASH_COMMAND IFS=$' \t\n'
   cleanup_stack_unwind
   release_all_locks
   trace_off
@@ -266,7 +268,7 @@ cleanup_stack_unwind() {
     local clean_func=${CLEANUP_STACK[$k]}
     if declare -F "$clean_func" >/dev/null; then
       echo "  [$k] Calling: $clean_func" >&2
-      $clean_func || echo "      (Warning: '$clean_func' failed, continuing...)" >&2
+      "$clean_func" || echo "      (Warning: '$clean_func' failed, continuing...)" >&2
     else
       echo "  [$k] Error: Function '$clean_func' not defined" >&2
     fi
@@ -348,7 +350,8 @@ decode() {
 #   func 123 timeout=30 verbose
 #
 get_params() {
-  local arg key buf=
+  (( $# )) || return 0
+  local arg key buf= IFS=$' \t\n'
   local -i n=1
   for arg; do
     key=${arg%%=*}
@@ -357,6 +360,22 @@ get_params() {
     ((n++))
   done
   echo "${buf:+local -r}$buf"
+}
+
+split_string() {
+  local -n _output_arr=$1
+  local _input=$2 _delim=${3-,}
+  local IFS=$_delim
+  _output_arr=( $_input )
+}
+
+split_string_strict() {
+  local -n _output_arr=$1
+  local _input=$2 _delim=${3-,}
+  _output_arr=()
+  [[ $_input ]] || return 0
+  mapfile -d "$_delim" -t _output_arr <<< "$_input"
+  _output_arr[-1]=${_output_arr[-1]%$'\n'}
 }
 
 set_markers() {
@@ -543,8 +562,9 @@ configure_vpn_plain() {
   # Configure interface $DEV
   ip link set $DEV mtu ${PARAM_VAL[Interface:MTU]} #! Failed to configure MTU '${PARAM_VAL[Interface:MTU]}' for interface '$DEV'
 
-  local addr IFS=,
-  for addr in ${PARAM_VAL[Interface:Address]}; do
+  local addr a=()
+  split_string a "${PARAM_VAL[Interface:Address]}"
+  for addr in "${a[@]}"; do
     ip addr add "$addr" dev $DEV #! Failed to add address '$addr' to interface '$DEV'
   done
   ip link set $DEV up #! Failed to bring up interface '$DEV'
@@ -553,8 +573,9 @@ configure_vpn_plain() {
   set_source_routing
 
   if [[ $CMD == @(up|fup) ]]; then
-    local set_override= IFS=,
-    for k in ${PARAM_VAL[Peer:AllowedIPs]}; do
+    local k set_override=
+    split_string a "${PARAM_VAL[Peer:AllowedIPs]}"
+    for k in "${a[@]}"; do
       [[ $k == "0.0.0.0/0" ]] && { set_override=1; continue; }
       ip route add "$k" dev $DEV #! Cannot add route to $k
     done
@@ -563,8 +584,9 @@ configure_vpn_plain() {
 
   if [[ $CMD == @(up|fup|bupd) && -v PARAM_VAL[Interface:DNS] ]]; then
     # We have have at least one valid nameserver ip. Configure DNS.
-    local k= q= IFS=,
-    for k in ${PARAM_VAL[Interface:DNS]}; do
+    local k q=
+    split_string a "${PARAM_VAL[Interface:DNS]}"
+    for k in "${a[@]}"; do
       q+="nameserver $k"$'\n'
       [[ $CMD == bupd ]] && ip route add "$k" dev $DEV #W Cannot add route to nameserver $k
     done
@@ -579,8 +601,9 @@ configure_vpn_plain() {
 
 check_dns_reachability() {
   local dns_list=$1 # strict csv
-  local nsip route_info current_dev dns_warnings= IFS=,
-  for nsip in $dns_list; do
+  local nsip route_info current_dev dns_warnings= a=()
+  split_string a "$dns_list"
+  for nsip in "${a[@]}"; do
     if route_info=$(ip route get "$nsip" 2>/dev/null); then
       if [[ $route_info != *"dev $DEV"* ]]; then
         if [[ $route_info =~ dev\ ([^[:space:]]+) ]]; then
@@ -629,8 +652,9 @@ set_source_routing() {
   done
   ((t > 51999)) && error "Could not find an empty routing table in the range 51820..51999" fatal
   ip route add default dev $DEV table $t #! Could not add default route via $DEV in table $t
-  local addr IFS=,
-  for addr in ${PARAM_VAL[Interface:Address]}; do
+  local addr a=()
+  split_string a "${PARAM_VAL[Interface:Address]}"
+  for addr in "${a[@]}"; do
     ip rule add from ${addr%/*} table $t #! Could not add source routing rule for ip address ${addr%/*}
   done
 }
@@ -665,32 +689,37 @@ compute_mtu() {
 
 configure_vpn_in_namespace() {
 
+  local nscmd="ip netns exec $NAMESPACE"
   # Create and configure namespace
   ip netns add $NAMESPACE #! Failed to create namespace '$NAMESPACE'
   ip link set $DEV netns $NAMESPACE #! Failed to move interface '$DEV' to namespace '$NAMESPACE'
-  ip netns exec $NAMESPACE ip link set lo up #! Failed to bring up loopback interface in namespace '$NAMESPACE'
+  $nscmd ip link set lo up #! Failed to bring up loopback interface in namespace '$NAMESPACE'
   # Configure interface $DEV
-  ip netns exec $NAMESPACE ip link set $DEV mtu ${PARAM_VAL[MTU]} #! Failed to configure MTU '${PARAM_VAL[MTU]} for interface '$DEV'
-  error XXX fatal
-  local addr IFS=,
-  for addr in ${PARAM_VAL[Interface:Address]}; do
-    ip netns exec $NAMESPACE ip addr add "$addr" dev $DEV :"Failed to configure address '$addr' for interface '$DEV'"
+  $nscmd ip link set $DEV mtu ${PARAM_VAL[Interface:MTU]}
+    #! Failed to configure MTU '${PARAM_VAL[Interface:MTU]}' for interface '$DEV'
+  local addr a=()
+  split_string a "${PARAM_VAL[Interface:Address]}"
+  for addr in "${a[@]}"; do
+    $nscmd ip addr add "$addr" dev $DEV #! Failed to configure address '$addr' for interface '$DEV'
   done
-  ip netns exec $NAMESPACE ip link set $DEV up :"Failed to bring up interface '$DEV'"
+  $nscmd ip link set $DEV up #! Failed to bring up interface '$DEV'
 
   # Add default route
-  ip netns exec $NAMESPACE ip route add default dev $DEV :"Could not add default route via $DEV in namespace $NAMESPACE"
+  $nscmd ip route add default dev $DEV #! Could not add default route via $DEV in namespace $NAMESPACE
   # Configure DNS
-  if mkdir -p /etc/netns/$NAMESPACE; then
-    local k IFS=,
-    for k in ${PARAM_VAL[Interface:DNS]}; do
+  local dir=/etc/netns/$NAMESPACE
+  local res=$dir/resolv.conf
+  if mkdir -p $dir; then
+    local k
+    split_string a "${PARAM_VAL[Interface:DNS]}"
+    for k in "${a[@]}"; do
       echo "nameserver $k"
-    done > /etc/netns/$NAMESPACE/resolv.conf
+    done > $res
   else
-    warn "Cannot create directory /etc/netns/$NAMESPACE"
+    warn "Cannot create directory $dir"
   fi
   # Check if we have at least one DNS server
-  if [[ ! -s /etc/netns/$NAMESPACE/resolv.conf ]]; then
+  if [[ ! -s $res ]]; then
     warn "No valid DNS servers configured"
   fi
 
@@ -721,8 +750,9 @@ start_bridges() {
     done
     [[ -e $netns_path ]] || error "Cannot locate netns file for '$NAMESPACE'" fatal
 
-    local b b_name b_ext b_int b_sock b_unit_int b_unit_ext IFS=,
-    for b in ${PARAM_VAL[WGC:Bridges]}; do
+    local b b_name b_ext b_int b_sock b_unit_int b_unit_ext a=()
+    split_string a "${PARAM_VAL[WGC:Bridges]}"
+    for b in "${a[@]}"; do
       IFS=: read -r b_name b_ext b_int <<< "$b"
 
       b_sock=/run/wgc.$VPN.$b_name.sock
@@ -864,7 +894,7 @@ get_ns_pids() {
   local pid pids=
   local -a e
   # filter out forwarding bridges by looking for WGC_BRIDGE in process environment
-  for pid in $(ip netns pids $NAMESPACE :); do
+  for pid in $(ip netns pids $NAMESPACE 2>/dev/null); do
     e=()
     mapfile -d '' e < /proc/$pid/environ 2>/dev/null || continue
     [[ ${e[*]} == *WGC_BRIDGE=* ]] && continue
@@ -883,7 +913,7 @@ kill_processes() {
   echo -ne "\033[?25l" # hide cursor
   while [[ "$pids" && "$d" ]]; do
     sleep 0.5
-    pids=$(ip netns pids $NAMESPACE :) || true
+    pids=$(get_ns_pids)
     d=${d%$'\u2591'} # remove one LIGHT SHADE
     echo -ne "\r$h$d" # paint the bar over itself
     h+=$'\u2588' # append a FULL BLOCK
@@ -894,7 +924,7 @@ kill_processes() {
     kill -9 $pids &>/dev/null || true
     sleep 0.1
     # check again
-    pids=$(ip netns pids $NAMESPACE :) || true
+    pids=$(get_ns_pids)
     [[ $pids ]] && warn "Processes still running: $pids" || true
   fi
 }
@@ -978,14 +1008,14 @@ show_state() {
       ip -c route show table all | grep -F --color $DEV || echo "  (none)"
       echo
       local t json regex
-      if t=$(find_source_routing_table); then
-        if json=$(ip -j -br addr show "$DEV" :); then
+      if find_source_routing_table t; then
+        if json=$(ip -j -br addr show $DEV 2>/dev/null); then
           regex='"local":"(([0-9]{1,3}\.){3}[0-9]{1,3})"'
           echo "Rules:"
           while [[ $json =~ $regex ]]; do
             ip rule list from "${BASH_REMATCH[1]}" table $t
             json="${json#*"${BASH_REMATCH[0]}"}"
-          done | grep -F --color "from $addr" || echo "  (none)"
+          done | grep -E --color '[0-9.]+' || echo "  (none)"
           [[ ${BASH_REMATCH[1]} ]] || warn "Could not find $DEV ip address"
         else
           warn "Could not find $DEV ip address"
@@ -1076,17 +1106,17 @@ show_active_vpns() {
   while read -r ns _; do
     [[ $ns == wgc_* ]] || continue
     dev=$ns
-    ip netns exec $ns wg show $dev : || continue
-    read -r _ s addr < <(ip netns exec $ns ip -br -c address show $dev :) || true
+    ip netns exec $ns wg show $dev 2>/dev/null || continue
+    read -r _ s addr < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null || true)
     found=1
     echo $dev $s $addr
-  done < <(ip netns list :)
+  done < <(ip netns list 2>/dev/null || true)
   [[ $found ]] || echo "  (none)"
   echo
 }
 
 list_config_files() {
-  local f= g= Endpoint Address AllowedIPs IFS=, b=()
+  local f= g= Endpoint Address AllowedIPs
   echo -e "Looking in $CFGDIR\n"
   prc "+W%-12s %-4s %-18s %-29s %s+/\n" Name Br. Address Endpoint AllowedIPs
   prc "+A%-12s %-4s %-18s %-29s %s+/\n" ---- --- ------- -------- ----------
@@ -1100,7 +1130,7 @@ list_config_files() {
     Address=${PARAM_VAL[Interface:Address]%%,*}
     AllowedIPs=${PARAM_VAL[Peer:AllowedIPs]}
     (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
-    b=(); [[ -v PARAM_VAL[WGC/Bridges] ]] && b=( ${PARAM_VAL[WGC:Bridges]} )
+    local b=(); [[ -v PARAM_VAL[WGC/Bridges] ]] && split_string b "${PARAM_VAL[WGC:Bridges]}"
     prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#b[@]} "$Address" "$Endpoint" "$AllowedIPs"
   done
 }
@@ -1147,8 +1177,9 @@ show_config() {
     echo
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
     prc "+A%-20s%s+/\n"  -----------------   ------------------
-    local b b_name b_ext b_int IFS=,
-    for b in ${PARAM_VAL[WGC:Bridges]}; do
+    local b b_name b_ext b_int a=()
+    split_string a "${PARAM_VAL[WGC:Bridges]}"
+    for b in "${a[@]}"; do
       IFS=: read -r b_name b_ext b_int <<< "$b"
       prc "+y%-19s+/ %s +A%s+/ %s\n" "$b_name" "$b_ext" "->" "$b_int"
     done
@@ -1607,7 +1638,8 @@ _wgc_completion() {
     case "$prev" in
       up|fup|bup|bupd|nup|conf|parse)
         # VPN config file list
-        local v modtime=$(stat -c %y "$cfgdir_path" 2>/dev/null) cfgdir_path=${WGC_CFGDIR:-/etc/wireguard}
+        local cfgdir_path=${WGC_CFGDIR:-/etc/wireguard}
+        local v modtime=$(stat -c %y "$cfgdir_path" 2>/dev/null)
         if [[ $_wgc_last_cfgdir_modtime && $modtime == "$_wgc_last_cfgdir_modtime" \
               && $cfgdir_path == "$_wgc_last_cfgdir_path" ]]; then
           v=$_wgc_last_cfgdir_list
@@ -1914,14 +1946,14 @@ pop_cleanup() {
 # - On trap ERR: special comment tags (#!|#\?|#W|#>|#:|#w) as error messages
 # - Context passed as named args (command, exit_code) when arg1 is CRASH
 error() {
-  local p_exit_code=$? msg=$1; shift
+  local p_exit_code=$? msg=$1 IFS=$' \t\n'; shift
   local p_fatal= p_blameparent=
   local p_command=$BASH_COMMAND p_line=${BASH_LINENO[0]} p_source=${BASH_SOURCE[1]}
   eval "$(get_params "$@")"
-  line=$p_line; [[ $p_blameparent ]] && line=${BASH_LINENO[1]}
+  local line=$p_line; [[ $p_blameparent ]] && line=${BASH_LINENO[1]}
 
   local exit_target=$((p_exit_code>0 ? p_exit_code : 1))
-  local original_traps=$(trap -p) IFS=$' \t\n'
+  local original_traps=$(trap -p)
   trap - ERR INT TERM
 
   declare -g ERROR_HANDLED=1
@@ -1952,7 +1984,7 @@ error() {
          continuation_idx=2
       fi
 
-      if (( continuation_idx > 0 )); then
+      if (( continuation_idx )); then
          tag=${BASH_REMATCH[1]}
          custom_msg=${BASH_REMATCH[2]}
          local i l
@@ -2030,6 +2062,8 @@ error() {
     echo "Aborted." >&2
     exit $exit_target
   fi
+
+  unset ERROR_HANDLED
 
   [[ $original_traps ]] && eval "$original_traps"
   return 0 # allow to use error() as soft error handler without adding ||true to avoid trap ERR and recursion
