@@ -20,7 +20,7 @@
 # Guard against sourcing.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
-shopt -s extglob # Allow parsing of extended globbing
+shopt -s extglob # Allow parsing of extended globbing syntax
 [[ ${1:-} == trace ]] && shopt -s extdebug # Enable precise and absolute LINENO
 
 doit() {
@@ -130,14 +130,6 @@ doit() {
   exit 0
 }
 
-has_auth() {
-  [[ $(sha512sum <<< "${WGC_AUTH:-}") == 3bb5692159057f407e9dca8f255e8eef* ]]
-}
-
-assert_auth() {
-  has_auth || error "WGC_AUTH is wrong." fatal
-}
-
 show_usage() {
   local a= b= c= n=
   if [[ $HAS_COLORS ]]; then
@@ -206,6 +198,14 @@ ${a}Bash Completion:${n}
   To enable bash completion: ${c}wgc completion${n}
 EOF
 printf "\n%s\n\n" "$usage"
+}
+
+has_auth() {
+  [[ $(sha512sum <<< "${WGC_AUTH:-}") == 3bb5692159057f407e9dca8f255e8eef* ]]
+}
+
+assert_auth() {
+  has_auth || error "Bad password in WGC_AUTH." fatal
 }
 
 trace_on() {
@@ -1313,6 +1313,7 @@ check_dup() {
 
 validate_Interface_Address() {
   collect_all_ipv4_cidr ,
+  [[ -v PARAM_VAL[Interface/Address] ]] && check_ipaddr_overlap "${PARAM_VAL[Interface:Address]}"
 }
 
 validate_Interface_DNS() {
@@ -1413,8 +1414,7 @@ collect_all_ipv4() {
     fi
     ((++b))
   done
-  IFS=$sep
-  ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
+  ((f>0 && d==0 && b==0 )) && { IFS=$sep; PARAM_VAL[$p]=${out[*]}; return 0; }
   ((f==0)) && add_issue "$n" "FATAL: Could not find any IPv4 address in $key"
   ((d>0))  && add_issue "$n" "FATAL: Found $d duplicate IPv4 addresses in $key"
   ((b>0))  && add_issue "$n" "FATAL: Found $b invalid IPv4 addresses in $key"
@@ -1433,8 +1433,11 @@ collect_all_ipv4_cidr() {
     fi
     ((++b))
   done
-  IFS=$sep
-  ((f>0 && d==0 && b==0 )) && { PARAM_VAL[$p]=${out[*]}; return 0; }
+  if ((f>0 && d==0 && b==0 )); then
+    IFS=$sep; PARAM_VAL[$p]=${out[*]}
+    PARAM_VAL[${p/://}]=1 # parameter p=$section:$key is valid
+    return 0
+  fi
   ((f==0)) && add_issue "$n" "FATAL: Could not find any CIDR IPv4 address in $key"
   ((d>0))  && add_issue "$n" "FATAL: Found $d duplicate/overlapping CIDR IPv4 addresses in $key"
   ((b>0))  && add_issue "$n" "FATAL: Found $b invalid CIDR IPv4 addresses in $key"
@@ -1458,6 +1461,25 @@ is_valid_ipv4_cidr() {
   local oct="(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
   local regex="^$oct\.$oct\.$oct\.$oct(/([1-2]?[0-9]|3[012]))?$"
   [[ ${1:-} =~ $regex ]]
+}
+
+check_ipaddr_overlap() {
+  local a=() addr
+  split_string a "$1"
+  local route_info
+  for addr in "${a[@]%/*}"; do
+    route_info=$(ip route get "$addr" 2>/dev/null) || continue
+    [[ $route_info == *" via "* ]] && continue
+    [[ $route_info =~ dev\ ([^[:space:]]+) ]] || continue
+    local iface=${BASH_REMATCH[1]}
+    if [[ $iface == lo ]]; then
+      IFS=$' \t\n' read -r iface _ < <(ip -br addr show to "$addr" 2>/dev/null)
+      add_issue "$n" "FATAL: IP address '$addr' is already assigned${iface:+ to interface '$iface'}"
+      continue
+    fi
+    add_issue "$n" "WARNING: IP address '$addr' overlaps with interface '$iface'"
+  done
+  return 0
 }
 
 is_valid_port() {
@@ -2058,6 +2080,7 @@ safe_expand() {
 }
 
 # Expand only $var, not $(command) nor `command`. Safe for ";'" and so on.
+# Returns empty string if not authenticated.
 # Usage: expanded_cmd=$(safer_expand "$raw_cmd")
 safer_expand() {
   has_auth || return 0
