@@ -63,39 +63,20 @@ doit() {
   export LC_ALL=C LANG=C
   local IFS=$' \t\n'
 
-  local W X Y HAS_COLORS; local -A COLORS; set_markers; readonly W X Y HAS_COLORS COLORS
+  set_markers
 
-  # When a crash (e.g. unbounded var) triggers EXIT trap, the inherited local scopes are destroyed
-  declare -g CLEANUP_STACK=() TRACE_FILE= TRACE_FD=
-  declare -gA LOCKS=()
-  declare -gi __tr_last=0 __tr_now=0 __tr_delta=0
-  [[ ${1:-} == trace ]] && { shift 1; trace_on; }
   trap 'at_exit' EXIT
   trap 'error TRAP-ERR' ERR
   trap 'error TRAP-INT' INT
   trap 'error TRAP-TERM' TERM
 
+  [[ ${1:-} == trace ]] && { shift 1; trace_on; }
+
   readonly CMD=${1:-} VPN=${2:-}
   readonly DEV=wgc_${VPN:-}
   readonly NAMESPACE=$DEV
 
-  local HAS_NAMESPACE IN_NAMESPACE
-  local -A PARAM_VAL PARAM_LNO
-  local -a PARAM_DEFS=( # mrs: Multivalued Required Secret
-    Interface:{Address:mr-,DNS:m--,MTU:---,ListenPort:---,FwMark:---,PrivateKey:-rs}
-    Peer:{PublicKey:-r-,PresharedKey:--s,Endpoint:-r-,AllowedIPs:mr-,PersistentKeepalive:---}
-    WGC:Bridges:m--
-  )
-  local -a PARAMS
-  local -A PARAM_ATTR SECTIONS
-  local def section key attr
-  for def in "${PARAM_DEFS[@]}"; do
-    IFS=: read -r section key attr <<< "$def"
-    PARAMS+=( $section:$key ); PARAM_ATTR[$section:$key]=$attr; SECTIONS[$section]=1
-  done
-  readonly PARAMS PARAM_ATTR SECTIONS
-
-  local CFGDIR; set_cfgdir; readonly CFGDIR
+  set_cfgdir
 
   case "$CMD" in
     up|fup|bup?(d)|nup)
@@ -229,7 +210,8 @@ printf "\n%s\n\n" "$usage"
 
 trace_on() {
   local IFS=$' \t\n' # This function could be called in a context where IFS is unexpected
-  TRACE_FILE=$(mktemp /dev/shm/wgc_trace_XX"XX"XX)
+  declare -g TRACE_FD= TRACE_FILE=$(mktemp /dev/shm/wgc_trace_XX"XX"XX)
+  declare -gi __tr_last=0 __tr_now=0 __tr_delta=0
   PS4='#+$((__tr_now=${EPOCHREALTIME/./},__tr_delta=__tr_now-__tr_last,__tr_last=__tr_now,__tr_delta))'
   PS4+=':${LINENO}:${FUNCNAME[0]}\n\011$BASH_COMMAND\n\011'
   shopt -s promptvars
@@ -242,8 +224,8 @@ trace_on() {
 
 trace_off() {
   set +x
+  [[ -v TRACE_FD ]] || return 0
   local IFS=$' \t\n' # This function could be called in a context where IFS is unexpected
-  [[ $TRACE_FD ]] || return 0
   exec {TRACE_FD}>&-
   unset BASH_XTRACEFD
   local dump=/tmp/${TRACE_FILE##*/}
@@ -263,6 +245,7 @@ at_exit() {
 }
 
 cleanup_stack_unwind() {
+  [[ -v CLEANUP_STACK ]] || return 0
   local k=
   for (( k=${#CLEANUP_STACK[@]}-1; k>=0; k-- )); do
     local clean_func=${CLEANUP_STACK[$k]}
@@ -276,6 +259,7 @@ cleanup_stack_unwind() {
 }
 
 acquire_lock() {
+  declare -gA LOCKS
   local id=$1 msg=$2
   local lock_file="/var/run/wgc.${id}.lock" fd
 
@@ -289,13 +273,14 @@ acquire_lock() {
 }
 
 release_all_locks() {
+  [[ -v LOCKS ]] || return 0
   local id fd
   for id in "${!LOCKS[@]}"; do
     fd=${LOCKS[$id]}
     flock -u $fd 2>/dev/null || true
     exec {fd}>&- || true
   done
-  LOCKS=()
+  unset LOCKS
 }
 
 # The lack of a ternary operator in Bash prompted me to create an improved version.
@@ -379,11 +364,9 @@ split_string_strict() {
 }
 
 set_markers() {
-  Y=$'\u2713'
-  X=$'\u274C'
-  W=$'\u2717'
+  declare -g W=$'\u2717' X=$'\u274C' Y=$'\u2713' HAS_COLORS=
+  declare -gA COLORS
   # Detect if terminal supports colors
-  HAS_COLORS=
   if [[ -t 1 ]] && (($(tput colors 2>/dev/null || echo 0) >= 8)); then
     Y=$'\e[1;32m'$Y$'\e[m' # green CHECK MARK
     X=$'\e[1;31m'$X$'\e[m' # red CROSS MARK
@@ -399,6 +382,7 @@ set_markers() {
     COLORS[${k^}]=$'\e[1;3'$i'm' # Uppercase: Bold/Bright
   done
   COLORS[/]=$'\e[m'
+  readonly W X Y HAS_COLORS COLORS
 }
 
 # prc - Print with color - A wrapper around printf
@@ -460,7 +444,8 @@ prc() {
 }
 
 set_cfgdir() {
-  CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
+  declare -g CFGDIR=${WGC_CFGDIR:-/etc/wireguard}
+  readonly CFGDIR
   # Validate directory
   [[ $CFGDIR == /* ]] #> WGC_CFGDIR must be an absolute path: $CFGDIR
   [[ ! -L "$CFGDIR" ]] #> Symlink not allowed '$CFGDIR'. Check WGC_CFGDIR.
@@ -476,7 +461,7 @@ set_cfgdir() {
     #> Debug: sudo ls -ldZ '$CFGDIR' && sudo getenforce
   [[ -f "$CFGDIR/wgc_enable" ]] #> Security: Approval file 'wgc_enable' missing in $CFGDIR. Root must create it.
   [[ ${status:11:1} == r ]]
-    #w Add 'r' bit for others to '$CFGDIR' (chmod o+r, current perms: ${status:4}) to enable command completion without sudo prompt.
+    #w Add 'r' bit for others to '$CFGDIR' (chmod o+r, current perms: ${status:4}) to enable full command completion.
   return 0
 }
 
@@ -545,7 +530,7 @@ start_vpn() {
 }
 
 is_connected() {
-  HAS_NAMESPACE= IN_NAMESPACE=
+  declare -g HAS_NAMESPACE= IN_NAMESPACE=
   has_namespace && HAS_NAMESPACE=$NAMESPACE
   ip -br link show $DEV &>/dev/null && return 0
   [[ $HAS_NAMESPACE ]] || return 1
@@ -1187,6 +1172,31 @@ show_config() {
   echo
 }
 
+init_config_schema() {
+  declare -gA PARAM_VAL=() PARAM_LNO=()
+
+  [[ -v PARAMS ]] && return 0
+
+  declare -ga PARAMS
+  declare -gA PARAM_ATTR SECTIONS
+
+  local -a param_defs=( # mrs: Multivalued Required Secret
+    Interface:{Address:mr-,DNS:m--,MTU:---,ListenPort:---,FwMark:---,PrivateKey:-rs}
+    Peer:{PublicKey:-r-,PresharedKey:--s,Endpoint:-r-,AllowedIPs:mr-,PersistentKeepalive:---}
+    WGC:Bridges:m--
+  )
+
+  local def section key attr
+  for def in "${param_defs[@]}"; do
+    IFS=: read -r section key attr <<< "$def"
+    PARAMS+=( $section:$key )
+    PARAM_ATTR[$section:$key]=$attr
+    SECTIONS[$section]=1
+  done
+
+  readonly PARAMS PARAM_ATTR SECTIONS
+}
+
 parse_config_file() {
   local -r config_file="$CFGDIR/$1.conf"; shift 1
   local p_relax= p_report= p_bridges=
@@ -1200,7 +1210,7 @@ parse_config_file() {
   local line n=0 section= key value
   local -A SEEN_SECTIONS=()
   local ISSUES=() HAS_FATAL_ISSUE=
-  PARAM_VAL=() PARAM_LNO=()
+  init_config_schema
   while read -r line || [[ $line ]]; do # also read last line if \n is missing
       ((++n))
       line=${line%%#*} # Remove comments
@@ -1639,24 +1649,13 @@ _wgc_completion() {
       up|fup|bup|bupd|nup|conf|parse)
         # VPN config file list
         local cfgdir_path=${WGC_CFGDIR:-/etc/wireguard}
-        local v modtime=$(stat -c %y "$cfgdir_path" 2>/dev/null)
-        if [[ $_wgc_last_cfgdir_modtime && $modtime == "$_wgc_last_cfgdir_modtime" \
-              && $cfgdir_path == "$_wgc_last_cfgdir_path" ]]; then
-          v=$_wgc_last_cfgdir_list
-        else
-          _wgc_last_cfgdir_modtime=$modtime; _wgc_last_cfgdir_path=$cfgdir_path
-          local -a c=( /usr/bin/find "$cfgdir_path" -maxdepth 1 -name \*.conf -type f )
-          local -a files
-          files=($("${c[@]}" 2>/dev/null)) || files=($(sudo "${c[@]}" 2>/dev/null)) || return 1
-          local f
-          for f in "${files[@]}"; do
-            f=${f##*/}; f=${f%.*}
-            [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-            v+="$f "
-          done
-          _wgc_last_cfgdir_list=$v
-        fi
-        COMPREPLY=( $(compgen -W "$v" -- "$cur") )
+        mapfile -t COMPREPLY < <(compgen -G "$cfgdir_path/${cur}*.conf")
+        COMPREPLY=( "${COMPREPLY[@]##*/}" ); COMPREPLY=( "${COMPREPLY[@]%.*}" )
+        local k
+        for k in "${!COMPREPLY[@]}"; do
+          [[ ${COMPREPLY[k]} == wg[0-9]* ]] && unset "COMPREPLY[k]" # remove wg0, wg1, wg2 ...
+        done
+        compopt -o filenames
         ;;
       down|kill|state)
         # Active VPNs in default namespace
@@ -1722,25 +1721,9 @@ EOF
 
   chmod 644 "$completion_file"
 
-  # Pre-populated cache (generated at install time)
-  local f
-  _wgc_last_cfgdir_list=
-  for f in $(find "$CFGDIR" -maxdepth 1 -name \*.conf -type f); do
-    f=${f##*/}; f=${f%.*}
-    [[ $f =~ wg[0-9]+ ]] && continue # exclude wg0, wg1, wg2 ...
-    _wgc_last_cfgdir_list+="$f "
-  done
-  _wgc_last_cfgdir_modtime=$(stat -c %y "$CFGDIR" 2>/dev/null)
-  printf "%s\n" \
-    "_wgc_last_cfgdir_list=${_wgc_last_cfgdir_list@Q}" \
-    "_wgc_last_cfgdir_modtime=${_wgc_last_cfgdir_modtime@Q}" \
-    "_wgc_last_cfgdir_path=${CFGDIR@Q}" >> "$completion_file"
-
   [[ $(stat -c %A "$CFGDIR") == *r?? ]] || \
-    warn "Completion for non-root users will use sudo to access configuration directory
-          whenever its modification time changes.
-          To avoid sudo consider: chmod o+r '$CFGDIR' # directory only!
-          Otherwise add line for find command in sudoers as explained below.%%" fatal
+    warn "Completion for non-root users is unable to read file names in configuration directory.
+          Execute: chmod o+r '$CFGDIR' # directory only!" fatal
 
   cat << EOF
 $Y Bash completion installed to $completion_file
@@ -1749,11 +1732,6 @@ To activate completion in current shell:
   source $completion_file
 
 Completion will be automatically available in new shell sessions.
-
-To avoid sudo password prompt:
-  sudo visudo -f /etc/sudoers.d/wgc-completion
-  Then add:
-  %sudo ALL=(ALL) NOPASSWD: /usr/bin/find $CFGDIR -maxdepth 1 -name *.conf -type f
 EOF
 }
 
@@ -1918,6 +1896,7 @@ assert_no_namespace() {
 
 # Add cleanup function to stack top
 push_cleanup() {
+  declare -ga CLEANUP_STACK
   local func_name="$1"
   CLEANUP_STACK+=($func_name)
 }
