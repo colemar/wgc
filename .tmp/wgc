@@ -1104,8 +1104,8 @@ show_active_vpns() {
 list_config_files() {
   local f= g= Endpoint Address AllowedIPs
   echo -e "Looking in $CFGDIR\n"
-  prc "+W%-12s %-4s %-18s %-29s %s+/\n" Name Br. Address Endpoint AllowedIPs
-  prc "+A%-12s %-4s %-18s %-29s %s+/\n" ---- --- ------- -------- ----------
+  prc "+W%-16s %-4s %-18s %-29s %s+/\n" Name Br. Address Endpoint AllowedIPs
+  prc "+A%-16s %-4s %-18s %-29s %s+/\n" ---- --- ------- -------- ----------
   mapfile -d '' < <(set +o noglob; printf '%s\0' "$CFGDIR"/*.conf 2>/dev/null)
   for f in "${MAPFILE[@]}"; do
     [[ -e "$f" ]] || continue
@@ -1117,7 +1117,7 @@ list_config_files() {
     AllowedIPs=${PARAM_VAL[Peer:AllowedIPs]}
     (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
     local b=(); [[ -v PARAM_VAL[WGC/Bridges] ]] && split_string b "${PARAM_VAL[WGC:Bridges]}"
-    prc "+c%-12s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#b[@]} "$Address" "$Endpoint" "$AllowedIPs"
+    prc "+c%-16s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#b[@]} "$Address" "$Endpoint" "$AllowedIPs"
   done
 }
 
@@ -1910,8 +1910,8 @@ remove_openresolv() {
 }
 
 validate_vpn_name() {
-  [[ $VPN =~ ^[a-zA-Z0-9_-]{1,11}$ ]]
-    #> Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max length is 11.
+  [[ $VPN =~ ^[a-zA-Z0-9_-]{1,16}$ ]]
+    #> Invalid VPN name '$VPN'. Use only alphanumeric, dash, underscore. Max length is 16.
 }
 
 assert_no_namespace() {
