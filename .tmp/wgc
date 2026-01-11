@@ -209,6 +209,7 @@ assert_auth() {
 }
 
 trace_on() {
+  assert_auth
   local IFS=$' \t\n' # This function could be called in a context where IFS is unexpected
   declare -g TRACE_FD= TRACE_FILE=$(mktemp /dev/shm/wgc_trace_XX"XX"XX)
   declare -gi __tr_last=0 __tr_now=0 __tr_delta=0
@@ -709,7 +710,7 @@ configure_vpn_in_namespace() {
   fi
 
   # Start proxyd/socat bridges
-  [[ -v PARAM_VAL[WGC:Bridges] ]] && start_bridges
+  [[ -v PARAM_VAL[WGC:Bridges] ]] && start_bridges || true
 }
 
 start_bridges() {
@@ -1091,7 +1092,7 @@ show_active_vpns() {
   while read -r ns _; do
     [[ $ns == wgc_* ]] || continue
     dev=$ns
-    ip netns exec $ns wg show $dev 2>/dev/null || continue
+    ip netns exec $ns wg show $dev &>/dev/null || continue
     read -r _ s addr < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null || true)
     found=1
     echo $dev $s $addr
@@ -1126,7 +1127,11 @@ show_config_file() {
   [[ -f $config_file ]] || error "File not found: $config_file" fatal
   [[ -L $config_file ]] && error "Security: Symlinks are not allowed: $config_file" fatal
   [[ -r $config_file ]] || error "Cannot read file: $config_file" fatal
-  sed -E 's/^([[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*).*/\1<HIDDEN>/' "$config_file"
+  local text x
+  IFS= read -r -d '' text < "$config_file" || true
+  x=${text#*PrivateKey*$'\n'};   text=${text%PrivateKey*"$x"};   text+=$'PrivateKey = <HIDDEN>\n'$x
+  x=${text#*PresharedKey*$'\n'}; text=${text%PresharedKey*"$x"}; text+=$'PresharedKey = <HIDDEN>\n'$x
+  printf %s "$text"
 }
 
 show_parsed_config_file() {
@@ -1313,7 +1318,7 @@ check_dup() {
 
 validate_Interface_Address() {
   collect_all_ipv4_cidr ,
-  [[ -v PARAM_VAL[Interface/Address] ]] && check_ipaddr_overlap "${PARAM_VAL[Interface:Address]}"
+  [[ -v PARAM_VAL[Interface/Address] ]] && check_ipaddr_overlap "${PARAM_VAL[Interface:Address]}" || true
 }
 
 validate_Interface_DNS() {
@@ -1435,7 +1440,7 @@ collect_all_ipv4_cidr() {
   done
   if ((f>0 && d==0 && b==0 )); then
     IFS=$sep; PARAM_VAL[$p]=${out[*]}
-    PARAM_VAL[${p/://}]=1 # parameter p=$section:$key is valid
+    PARAM_VAL[$section/$key]=1 # means parameter p=$section:$key is valid
     return 0
   fi
   ((f==0)) && add_issue "$n" "FATAL: Could not find any CIDR IPv4 address in $key"
@@ -1477,7 +1482,7 @@ check_ipaddr_overlap() {
       add_issue "$n" "FATAL: IP address '$addr' is already assigned${iface:+ to interface '$iface'}"
       continue
     fi
-    add_issue "$n" "WARNING: IP address '$addr' overlaps with interface '$iface'"
+    add_issue "$n" "IP address '$addr' overlaps with interface '$iface'"
   done
   return 0
 }
