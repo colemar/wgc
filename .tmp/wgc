@@ -262,7 +262,7 @@ cleanup_stack_unwind() {
 acquire_lock() {
   declare -gA LOCKS
   local id=$1 msg=$2
-  local lock_file="/var/run/wgc.${id}.lock" fd
+  local lock_file="/run/lock/wgc.${id}.lock" fd
 
   exec {fd}>"$lock_file" #> Cannot create lock file: $lock_file
   if ! flock -n $fd; then
@@ -294,6 +294,9 @@ release_all_locks() {
 # Matches <input> against a series of patterns, printing the result of the first match.
 # If no matches are found, prints the last argument (if any).
 # Always returns 0 (success) as exit code.
+#
+# Requires shopt -s extglob.
+#
 decode() {
   local val=$1; shift
   while (( $# >= 2 )); do
@@ -492,7 +495,26 @@ start_vpn() {
   fi
 
   # Configure WireGuard
-  # Notice: this was tested against possible attack vectors, do not modify the general approach!
+  # -------------------------------------------------------------------------
+  # eval rationale and invariants
+  #
+  # The use of `eval` here is intentional and limited to this single point.
+  # It is required to defer process substitution (<(...)) until the actual
+  # execution of the `wg` command.
+  #
+  # Safety relies on the following invariants:
+  #   - All interpolated values originate from PARAM_VAL[] and have already
+  #     been syntactically and semantically validated.
+  #   - All non-sensitive values are injected using ${var@Q}.
+  #   - Sensitive values (PrivateKey, PresharedKey) are passed only via
+  #     process substitution and never appear in plain text.
+  #   - No unquoted, user-controlled, or free-form data is concatenated
+  #     into the evaluated string.
+  #
+  # The constructed command is also intended to be human-readable for
+  # diagnostic purposes. If any of these invariants change, this `eval`
+  # must be reconsidered.
+  # -------------------------------------------------------------------------
   wadd() {
     [[ -v PARAM_VAL[$1] ]] || return 0
     if [[ ${3:-} ]]; then
@@ -778,7 +800,7 @@ start_bridges() {
       # 3. Health check
       local unit_to_check="$b_unit_ext.service"
       [[ $PROXYD_BIN ]] && unit_to_check="${b_unit_ext}.socket"
-      wait_for_unit_active "$unit_to_check"
+      wait_for_unit_active "$unit_to_check" "$b_name"
 
     done
     echo
@@ -786,7 +808,7 @@ start_bridges() {
 }
 
 wait_for_unit_active() {
-  local unit_to_check=$1 s=starting deadline=$((SECONDS+3)) # wait 2 to 3 seconds
+  local unit_to_check=$1 b_name=$2 s=starting deadline=$((SECONDS+3)) # wait 2 to 3 seconds
   while true; do
     if { timeout --signal=KILL 0.5 systemctl is-active --quiet "$unit_to_check"; } 2>&-; then
       s=active; break
@@ -907,7 +929,7 @@ kill_processes() {
   echo -ne "\r\033[K\033[?25h" # delete bar and restore cursor
   if [[ -z "$d" ]]; then # timeout
     echo "Forcibly terminating processes (SIGKILL)"
-    kill -9 $pids &>/dev/null || true
+    [[ $pids ]] && kill -9 $pids &>/dev/null || true
     sleep 0.1
     # check again
     pids=$(get_ns_pids)
@@ -950,7 +972,7 @@ clean_vpn() {
   if [[ $HAS_NAMESPACE ]]; then
     # Remove namespace
     local pids=$(ip netns pids $NAMESPACE)
-    kill -9 $pids &>/dev/null || true
+    [[ $pids ]] && kill -9 $pids &>/dev/null || true
     ip netns del $NAMESPACE || true
   fi
 }
@@ -1076,14 +1098,14 @@ show_bridges() {
 }
 
 show_active_vpns() {
-  local s= ns= dev= addr= found=
+  local ns= dev= addr= found=
   echo
   echo "Active VPNs in default namespace:"
   for dev in $(wg show interfaces); do
     [[ $dev == wgc_* ]] || continue
-    read -r _ s addr < <(ip -br -c address show $dev :) || true
+    read -r _ _ addr < <(ip -br -c address show $dev :) || true
     found=1
-    echo $dev $s $addr
+    echo ${dev#wgc_} $addr
   done
   [[ $found ]] || echo "  (none)"
   found=
@@ -1093,9 +1115,9 @@ show_active_vpns() {
     [[ $ns == wgc_* ]] || continue
     dev=$ns
     ip netns exec $ns wg show $dev &>/dev/null || continue
-    read -r _ s addr < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null || true)
+    read -r _ _ addr < <(ip netns exec $ns ip -br -c address show $dev 2>/dev/null || true)
     found=1
-    echo $dev $s $addr
+    echo ${dev#wgc_} $addr
   done < <(ip netns list 2>/dev/null || true)
   [[ $found ]] || echo "  (none)"
   echo
