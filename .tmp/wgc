@@ -567,7 +567,7 @@ has_namespace() {
 
 configure_vpn_plain() {
 
-  check_ipaddr_overlap
+  check_ipaddr_overlap "${PARAM_VAL[Interface:Address]}"
 
   # Configure interface $DEV
   ip link set $DEV mtu ${PARAM_VAL[Interface:MTU]} #! Failed to configure MTU '${PARAM_VAL[Interface:MTU]}' for interface '$DEV'
@@ -698,6 +698,8 @@ compute_mtu() {
 }
 
 configure_vpn_in_namespace() {
+  [[ -v PARAM_VAL[WGC:Bridges] && ! -v PARAM_VAL[WGC/Bridges] ]] && \
+    error "Found errors in key Bridges of section [WGC]." fatal
 
   local nscmd="ip netns exec $NAMESPACE"
   # Create and configure namespace
@@ -734,7 +736,7 @@ configure_vpn_in_namespace() {
   fi
 
   # Start proxyd/socat bridges
-  [[ -v PARAM_VAL[WGC:Bridges] ]] && start_bridges || true
+  [[ -v PARAM_VAL[WGC/Bridges] ]] && start_bridges
 }
 
 start_bridges() {
@@ -746,7 +748,7 @@ start_bridges() {
 
   if [[ ! $PROXYD_BIN ]] && ! command -v socat >/dev/null; then
 
-    warn "socat not found: cannot start bridges defined in [WGC-Bridges]"
+    warn "socat not found: cannot start bridges defined in [WGC]"
 
   else
 
@@ -1326,7 +1328,9 @@ validate_parameters() {
     [[ ${PARAM_ATTR[$p]:-} == m* ]] || check_dup || continue
     func_name="validate_${section}_$key"
     declare -F "$func_name" >/dev/null || error "FATAL: Internal error - Missing function '$func_name'" fatal
-    "$func_name"
+    if "$func_name"; then
+      PARAM_VAL[$section/$key]=1 # means parameter p=$section:$key is valid
+    fi
   done
   local -a missing_params=()
   for p in "${!PARAM_ATTR[@]}"; do
@@ -1356,23 +1360,27 @@ validate_Interface_MTU() {
   # min 576 for IPv4, min 1280 for IPv6
   [[ $v =~ ^([1-9][0-9]{2,4})$ ]] && (( v >= 576 && v <= 65535 )) && return 0
   add_issue "$n" "FATAL: Invalid $key value '$v' (must be 576-65535)"
+  return 1
 }
 
 validate_Interface_PrivateKey() {
   is_valid_key "$v" && return 0
   add_issue "$n" "FATAL: Invalid $key value"
+  return 1
 }
 
 validate_Interface_ListenPort() {
-  is_valid_port "$v" || { add_issue "$n" "FATAL: Invalid $key value '$v' (must be 1-65535)"; return 0; }
+  is_valid_port "$v" || { add_issue "$n" "FATAL: Invalid $key value '$v' (must be 1-65535)"; return 1; }
   local info
-  check_udp_port_usage "$v" info || add_issue "$n" "FATAL: UDP port '$v' is already used${info:+ by $info}"
-  return 0
+  check_udp_port_usage "$v" info && return 0
+  add_issue "$n" "FATAL: UDP port '$v' is already used${info:+ by $info}"
+  return 1
 }
 
 validate_Interface_FwMark() {
   [[ $v == off || $v =~ ^(0x[[:xdigit:]]{1,8}|0|[1-9][0-9]{0,9})$ && $v -le 0xFFFFFFFF ]] && return 0
   add_issue "$n" "FATAL: Invalid $key value '$v' (must be 0-4294967295 0x0-0xFFFFFFFF)"
+  return 1
 }
 
 validate_Peer_AllowedIPs() {
@@ -1380,13 +1388,13 @@ validate_Peer_AllowedIPs() {
 }
 
 validate_Peer_Endpoint() {
-  [[ ! $v =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]] && { add_issue "$n" "FATAL: Invalid $key value '$v'"; return 0; }
+  [[ ! $v =~ ^([-A-Za-z0-9.]+):([0-9]{1,5})$ ]] && { add_issue "$n" "FATAL: Invalid $key value '$v'"; return 1; }
   local host=${BASH_REMATCH[1]}; local port=${BASH_REMATCH[2]}
-  is_valid_port "$port" || add_issue "$n" "FATAL: Invalid $key port '$port'"
+  is_valid_port "$port" || { add_issue "$n" "FATAL: Invalid $key port '$port'"; return 1; }
   if ! is_valid_ipv4 "$host"; then
     local ip
     read -r ip _ < <(getent ahostsv4 "$host" || true) || true
-    is_valid_ipv4 "$ip" && host=$ip || add_issue "$n" "FATAL: Could not resolve $key host '$host'"
+    is_valid_ipv4 "$ip" && host=$ip || { add_issue "$n" "FATAL: Could not resolve $key host '$host'"; return 1; }
   fi
   PARAM_VAL[$p]="$host:$port"
   return 0
@@ -1395,6 +1403,7 @@ validate_Peer_Endpoint() {
 validate_Peer_PersistentKeepalive() {
   [[ $v =~ ^([1-9][0-9]{0,4}|0)$ ]] && (( v <= 65535 )) && return 0
   add_issue "$n" "FATAL: Invalid $key value '$v', must be 0-65535"
+  return 1
 }
 
 validate_Peer_PresharedKey() {
@@ -1404,6 +1413,7 @@ validate_Peer_PresharedKey() {
 validate_Peer_PublicKey()  {
   is_valid_key "$v" && return 0
   add_issue "$n" "FATAL: Invalid $key value '$v'"
+  return 1
 }
 
 validate_WGC_Bridges() {
@@ -1413,24 +1423,26 @@ validate_WGC_Bridges() {
   for bridge in ${v//,/ }; do
     ((++c))
     [[ $bridge =~ ^([a-zA-Z][a-zA-Z0-9_-]*):([0-9]+):([0-9]+)$ ]] || \
-      { add_issue "$n" "FATAL: Invalid bridge '$bridge'. Format must be <name>:<number>:<number>"; continue; }
+      { add_issue "$n" "Invalid bridge '$bridge'. Format must be <name>:<number>:<number>"; continue; }
     name=${BASH_REMATCH[1]}; ext=${BASH_REMATCH[2]}; int=${BASH_REMATCH[3]}
-    [[ -v seen_names[$name] ]] && { add_issue "$n" "FATAL: Duplicate bridge name '$name' in Bridges list"; continue; }
+    [[ -v seen_names[$name] ]] && { add_issue "$n" "Duplicate bridge name '$name' in Bridges list"; continue; }
     seen_names[$name]=1
     local pok=1
-    is_valid_port "$ext" || { add_issue "$n" "FATAL: Bridge '$name' has invalid external port '$ext', must be 1-65535"; pok=; }
-    is_valid_port "$int" || { add_issue "$n" "FATAL: Bridge '$name' has invalid internal port '$int', must be 1-65535"; pok=; }
+    is_valid_port "$ext" || { add_issue "$n" "Bridge '$name' has invalid external port '$ext', must be 1-65535"; pok=; }
+    is_valid_port "$int" || { add_issue "$n" "Bridge '$name' has invalid internal port '$int', must be 1-65535"; pok=; }
     [[ $pok ]] || continue
     [[ -v seen_ext_ports[$ext] ]] && \
-      { add_issue "$n" "FATAL: Bridge '$name' ext. port $ext conflicting with bridge '${seen_ext_ports[$ext]}'"; continue; }
+      { add_issue "$n" "Bridge '$name' ext. port $ext conflicting with bridge '${seen_ext_ports[$ext]}'"; continue; }
     seen_ext_ports[$ext]=$name
-    local info; check_tcp4_port_usage "$ext" info || \
-      add_issue "$n" "FATAL: Bridge '$name' ext. port $ext is already in use${info:+ by $info}"
+    local info
+    if ! check_tcp4_port_usage "$ext" info; then
+      add_issue "$n" "Bridge '$name' ext. port $ext is already in use${info:+ by $info}"
+      continue
+    fi
     bridges+=( "$name:$ext:$int" )
   done
-  (( c==0 || c > ${#bridges[*]} )) && return 0
+  (( c > ${#bridges[*]} )) && return 1
   local IFS=,; PARAM_VAL[WGC:Bridges]="${bridges[*]}"
-  PARAM_VAL[WGC/Bridges]=1 # Means WGC:Bridges is valid
   return 0
 }
 
@@ -1446,11 +1458,14 @@ collect_all_ipv4() {
     fi
     ((++b))
   done
-  ((f>0 && d==0 && b==0 )) && { IFS=$sep; PARAM_VAL[$p]=${out[*]}; return 0; }
+  if ((f>0 && d==0 && b==0 )); then
+    IFS=$sep; PARAM_VAL[$p]=${out[*]}
+    return 0
+  fi
   ((f==0)) && add_issue "$n" "FATAL: Could not find any IPv4 address in $key"
   ((d>0))  && add_issue "$n" "FATAL: Found $d duplicate IPv4 addresses in $key"
   ((b>0))  && add_issue "$n" "FATAL: Found $b invalid IPv4 addresses in $key"
-  return 0
+  return 1
 }
 
 collect_all_ipv4_cidr() {
@@ -1467,13 +1482,12 @@ collect_all_ipv4_cidr() {
   done
   if ((f>0 && d==0 && b==0 )); then
     IFS=$sep; PARAM_VAL[$p]=${out[*]}
-    PARAM_VAL[$section/$key]=1 # means parameter p=$section:$key is valid
     return 0
   fi
   ((f==0)) && add_issue "$n" "FATAL: Could not find any CIDR IPv4 address in $key"
   ((d>0))  && add_issue "$n" "FATAL: Found $d duplicate/overlapping CIDR IPv4 addresses in $key"
   ((b>0))  && add_issue "$n" "FATAL: Found $b invalid CIDR IPv4 addresses in $key"
-  return 0
+  return 1
 }
 
 is_valid_ipv4() {
