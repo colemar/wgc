@@ -20,49 +20,47 @@
 # Guard against sourcing.
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 1
 
-shopt -s extglob # Allow parsing of extended globbing syntax
 [[ ${1:-} == trace ]] && shopt -s extdebug # Enable precise and absolute LINENO
 
+if [ -z "$BASH_VERSION" ]; then
+  echo "ERROR: This script requires Bash. Please run with 'wgc'." >&2
+  exit 1
+fi
+if ((BASH_VERSINFO[0] < 4)) || ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4)); then
+  echo "ERROR: Bash 4.4 or newer is required (found $BASH_VERSION)." >&2
+  exit 1
+fi
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Sanitized auto-elevation
+safesudo=$(command -v sudo) || { echo "ERROR: sudo not found in standard paths: $PATH" >&2; exit 1; }
+if [[ ! $UID == 0 ]]; then
+  exec $safesudo WGC_CFGDIR="$WGC_CFGDIR" WGC_AUTH="$WGC_AUTH" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
+fi
+# unset fails when readonly, so use exec env -i
+[[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
+  exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
+
+# Shell state baseline
+set +abefhkmnptuBCEHPT
+shopt -u $(shopt | awk '/[[:space:]]on$/{print $1}')
+# What I want
+set +o posix       # Turn off Posix standard
+set -o hashall     # Remember the location of commands as they are looked up.
+set -o braceexpand # Perform brace expansion.
+set -o nounset     # Treat unset variables as an error.
+set -o pipefail    # Return value of a pipeline is the status of the last command to exit with a non-zero status.
+set -o noglob      # Disable globbing (enable it later temporarily if needed)
+set +o errexit     # Don't exit immediately if a command exits with a non-zero status. Rely to trap ERR instead.
+set -o errtrace    # Trap ERR is inherited by functions, command substitutions and subshells.
+shopt -s extglob   # Enable extended glob patterns: x(y)
+shopt -s nullglob  # Patterns which match no files expand to a null string
+shopt -s checkwinsize extquote
+export LC_ALL=C.utf8 LANG=C.utf8
+IFS=$' \t\n'
+
 doit() {
-  if [ -z "$BASH_VERSION" ]; then
-    echo "ERROR: This script requires Bash. Please run with 'wgc'." >&2
-    exit 1
-  fi
-  if ((BASH_VERSINFO[0] < 4)) || ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4)); then
-    echo "ERROR: Bash 4.4 or newer is required (found $BASH_VERSION)." >&2
-    exit 1
-  fi
-
-  # Sanitized auto-elevation
-  local safesudo
-  safesudo=$(command -p -v sudo) || { echo "ERROR: sudo not found in standard paths." >&2; exit 1; }
-  if [[ ! $UID == 0 ]]; then
-    exec $safesudo WGC_CFGDIR="$WGC_CFGDIR" WGC_AUTH="$WGC_AUTH" BASH_ENV= ENV= CDPATH= IFS= "$0" "$@"
-  fi
-  # unset fails when readonly, so use exec env -i
-  [[ ${BASH_ENV:-}${ENV:-}${CDPATH:-} ]] && \
-    exec /usr/bin/env -u BASH_ENV -u ENV -u CDPATH "$0" "$@"
-
-  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-  # Shell state baseline
-  set +abefhkmnptuBCEHPT
-  shopt -u $(shopt | awk '/[[:space:]]on$/{print $1}')
-  # What I want
-  set +o posix       # Turn off Posix standard
-  set -o hashall     # Remember the location of commands as they are looked up.
-  set -o braceexpand # Perform brace expansion.
-  set -o nounset     # Treat unset variables as an error.
-  set -o pipefail    # Return value of a pipeline is the status of the last command to exit with a non-zero status.
-  set -o noglob      # Disable globbing (enable it later temporarily if needed)
-  set +o errexit     # Don't exit immediately if a command exits with a non-zero status. Rely to trap ERR instead.
-  set -o errtrace    # Trap ERR is inherited by functions, command substitutions and subshells.
-  shopt -s extglob   # Enable extended glob patterns: x(y)
-  shopt -s nullglob  # Patterns which match no files expand to a null string
-  shopt -s checkwinsize extquote
-  export LC_ALL=C LANG=C
-  local IFS=$' \t\n'
-
   set_markers
 
   trap 'at_exit' EXIT
@@ -274,7 +272,7 @@ acquire_lock() {
 }
 
 release_all_locks() {
-  [[ -v LOCKS ]] || return 0
+  declare -p LOCKS &>/dev/null || return 0
   local id fd
   for id in "${!LOCKS[@]}"; do
     fd=${LOCKS[$id]}
@@ -368,6 +366,7 @@ split_string_strict() {
 }
 
 set_markers() {
+  declare -gr LIGHT_SHADE=$'\u2591' FULL_BLOCK=$'\u2588'
   declare -g W=$'\u2717' X=$'\u274C' Y=$'\u2713' HAS_COLORS=
   declare -gA COLORS
   # Detect if terminal supports colors
@@ -567,6 +566,9 @@ has_namespace() {
 }
 
 configure_vpn_plain() {
+
+  check_ipaddr_overlap
+
   # Configure interface $DEV
   ip link set $DEV mtu ${PARAM_VAL[Interface:MTU]} #! Failed to configure MTU '${PARAM_VAL[Interface:MTU]}' for interface '$DEV'
 
@@ -884,7 +886,7 @@ stop_vpn() {
       else
         error "Processes running in namespace $NAMESPACE:
                $(ps -fp $pids)
-               Force stop (killing processes) with: wgc down $VPN force" fatal
+               Force stop (killing processes) with: wgc kill $VPN" fatal
       fi
     fi
   fi
@@ -917,14 +919,14 @@ kill_processes() {
   kill $pids &>/dev/null || true
   # paint increasing bar for timeout
   local h= d= timeout=10 # seconds
-  eval printf -v d "$'\u2591'%.0s" {1..$((timeout*2))} # timeout*2 LIGHT SHADEs in d
+  eval printf -v d ${LIGHT_SHADE}%.0s {1..$((timeout*2))} # timeout*2 LIGHT SHADEs in d
   echo -ne "\033[?25l" # hide cursor
   while [[ "$pids" && "$d" ]]; do
     sleep 0.5
     pids=$(get_ns_pids)
-    d=${d%$'\u2591'} # remove one LIGHT SHADE
+    d=${d%$LIGHT_SHADE} # remove one LIGHT SHADE
     echo -ne "\r$h$d" # paint the bar over itself
-    h+=$'\u2588' # append a FULL BLOCK
+    h+=$FULL_BLOCK # append a FULL BLOCK
   done
   echo -ne "\r\033[K\033[?25h" # delete bar and restore cursor
   if [[ -z "$d" ]]; then # timeout
@@ -1103,7 +1105,7 @@ show_active_vpns() {
   echo "Active VPNs in default namespace:"
   for dev in $(wg show interfaces); do
     [[ $dev == wgc_* ]] || continue
-    read -r _ _ addr < <(ip -br -c address show $dev :) || true
+    read -r _ _ addr < <(ip -br -c address show $dev 2>/dev/null || true)
     found=1
     echo ${dev#wgc_} $addr
   done
@@ -1151,8 +1153,12 @@ show_config_file() {
   [[ -r $config_file ]] || error "Cannot read file: $config_file" fatal
   local text x
   IFS= read -r -d '' text < "$config_file" || true
-  x=${text#*PrivateKey*$'\n'};   text=${text%PrivateKey*"$x"};   text+=$'PrivateKey = <HIDDEN>\n'$x
-  x=${text#*PresharedKey*$'\n'}; text=${text%PresharedKey*"$x"}; text+=$'PresharedKey = <HIDDEN>\n'$x
+  if [[ $text == *PrivateKey*([[:space:]])=* ]]; then
+    x=${text#*PrivateKey*$'\n'};   text=${text%PrivateKey*"$x"};   text+=$'PrivateKey = <HIDDEN>\n'$x
+  fi
+  if [[ $text == *PresharedKey*([[:space:]])=* ]]; then
+    x=${text#*PresharedKey*$'\n'}; text=${text%PresharedKey*"$x"}; text+=$'PresharedKey = <HIDDEN>\n'$x
+  fi
   printf %s "$text"
 }
 
@@ -1340,7 +1346,6 @@ check_dup() {
 
 validate_Interface_Address() {
   collect_all_ipv4_cidr ,
-  [[ -v PARAM_VAL[Interface/Address] ]] && check_ipaddr_overlap "${PARAM_VAL[Interface:Address]}" || true
 }
 
 validate_Interface_DNS() {
@@ -1501,10 +1506,10 @@ check_ipaddr_overlap() {
     local iface=${BASH_REMATCH[1]}
     if [[ $iface == lo ]]; then
       IFS=$' \t\n' read -r iface _ < <(ip -br addr show to "$addr" 2>/dev/null)
-      add_issue "$n" "FATAL: IP address '$addr' is already assigned${iface:+ to interface '$iface'}"
+      error "IP address '$addr' is already assigned${iface:+ to interface '$iface'}" fatal blameparent
       continue
     fi
-    add_issue "$n" "IP address '$addr' overlaps with interface '$iface'"
+    warn "IP address '$addr' overlaps with interface '$iface'"
   done
   return 0
 }
@@ -1603,6 +1608,8 @@ exec_in_namespace() {
     # wgc direct execution by root: no user/env switch needed
     local PAYLOAD=("$@")
   fi
+
+  release_all_locks
 
   # Execution with Anti-Leak protection (NSCD)
   # If we are in a VPN namespace with custom DNS and the host's nscd socket exists,
