@@ -698,8 +698,7 @@ compute_mtu() {
 }
 
 configure_vpn_in_namespace() {
-  [[ -v PARAM_VAL[WGC:Bridges] && ! -v PARAM_VAL[WGC/Bridges] ]] && \
-    error "Found errors in key Bridges of section [WGC]." fatal
+  [[ ${PARAM_VAL[WGC/Bridges]:-} == KO ]] && error "Found errors in key Bridges of section [WGC]." fatal
 
   local nscmd="ip netns exec $NAMESPACE"
   # Create and configure namespace
@@ -736,7 +735,7 @@ configure_vpn_in_namespace() {
   fi
 
   # Start proxyd/socat bridges
-  [[ -v PARAM_VAL[WGC/Bridges] ]] && start_bridges
+  [[ ${PARAM_VAL[WGC/Bridges]:-} == OK ]] && start_bridges
 }
 
 start_bridges() {
@@ -1142,7 +1141,7 @@ list_config_files() {
     Address=${PARAM_VAL[Interface:Address]%%,*}
     AllowedIPs=${PARAM_VAL[Peer:AllowedIPs]}
     (( ${#Endpoint} > 29 )) && Endpoint="${Endpoint:0:27}.."
-    local b=(); [[ -v PARAM_VAL[WGC/Bridges] ]] && split_string b "${PARAM_VAL[WGC:Bridges]}"
+    local b=(); [[ ${PARAM_VAL[WGC/Bridges]:-} == OK ]] && split_string b "${PARAM_VAL[WGC:Bridges]}"
     prc "+c%-16s +y%-4s +m%-18s +r%-29s +g%s+/\n" "$g" ${#b[@]} "$Address" "$Endpoint" "$AllowedIPs"
   done
 }
@@ -1193,7 +1192,7 @@ show_config() {
     [[ $missing && ${PARAM_ATTR[$p]:-} == ?r* ]] && prc " $W +R%s+/" required
     printf "\n"
   done
-  if [[ -v PARAM_VAL[WGC/Bridges] ]]; then
+  if [[ ${PARAM_VAL[WGC/Bridges]:-} == OK ]]; then
     echo
     prc "+W%-20s%s+/\n" "Forwarding Bridge" "ExtPort -> IntPort"
     prc "+A%-20s%s+/\n"  -----------------   ------------------
@@ -1328,9 +1327,7 @@ validate_parameters() {
     [[ ${PARAM_ATTR[$p]:-} == m* ]] || check_dup || continue
     func_name="validate_${section}_$key"
     declare -F "$func_name" >/dev/null || error "FATAL: Internal error - Missing function '$func_name'" fatal
-    if "$func_name"; then
-      PARAM_VAL[$section/$key]=1 # means parameter p=$section:$key is valid
-    fi
+    "$func_name" && PARAM_VAL[$section/$key]=OK || PARAM_VAL[$section/$key]=KO # 1 means parameter p=$section:$key is valid
   done
   local -a missing_params=()
   for p in "${!PARAM_ATTR[@]}"; do
