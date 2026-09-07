@@ -735,7 +735,7 @@ configure_vpn_in_namespace() {
   fi
 
   # Start proxyd/socat bridges
-  [[ ${PARAM_VAL[WGC/Bridges]:-} == OK ]] && start_bridges
+  [[ ${PARAM_VAL[WGC/Bridges]:-} == OK ]] && start_bridges || true
 }
 
 start_bridges() {
@@ -1731,13 +1731,13 @@ _wgc_completion() {
         local i v
         for i in "${ifaces[@]}"; do
           [[ $i == wgc_* ]] || continue
-          v+="${i#*wgc_} "
+          v+="${i#wgc_} "
         done
         # Active VPNs (namespaces)
         local n
         while read -r n _; do
           [[ $n == wgc_* ]] || continue
-          v+="${n#*wgc_} "
+          v+="${n#wgc_} "
         done < <(/usr/sbin/ip netns list 2>/dev/null)
         COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
@@ -1746,7 +1746,7 @@ _wgc_completion() {
         local n v
         while read -r n _; do
           [[ $n == wgc_* ]] || continue
-          v+="${n#*wgc_} "
+          v+="${n#wgc_} "
         done < <(/usr/sbin/ip netns list 2>/dev/null)
         COMPREPLY=( $(compgen -W "$v" -- "$cur") )
         ;;
