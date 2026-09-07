@@ -1327,7 +1327,7 @@ validate_parameters() {
     [[ ${PARAM_ATTR[$p]:-} == m* ]] || check_dup || continue
     func_name="validate_${section}_$key"
     declare -F "$func_name" >/dev/null || error "FATAL: Internal error - Missing function '$func_name'" fatal
-    "$func_name" && PARAM_VAL[$section/$key]=OK || PARAM_VAL[$section/$key]=KO # 1 means parameter p=$section:$key is valid
+    "$func_name" && PARAM_VAL[$section/$key]=OK || PARAM_VAL[$section/$key]=KO # OK means parameter p=$section:$key is valid
   done
   local -a missing_params=()
   for p in "${!PARAM_ATTR[@]}"; do
